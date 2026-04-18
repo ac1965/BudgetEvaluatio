@@ -6,17 +6,22 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: 3005,
+    cors: true,
     proxy: {
       '/api': {
-        target: process.env.REACT_APP_API_URL || 'http://backend:8000',
+        target: 'http://backend:8000',
         changeOrigin: true,
+        secure: false,
         rewrite: (path) => path.replace(/^\/api/, ''),
+        configure: (proxy) => {
+          proxy.on('error', (err) => {
+            console.error('[proxy error]', err.message);
+          });
+          proxy.on('proxyReq', (proxyReq, req) => {
+            console.log('[proxy]', req.method, req.url, '→', proxyReq.path);
+          });
+        },
       },
     },
-  },
-  define: {
-    'process.env.REACT_APP_API_URL': JSON.stringify(
-      process.env.REACT_APP_API_URL || 'http://localhost:8000'
-    ),
   },
 })

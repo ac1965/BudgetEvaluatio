@@ -4,7 +4,9 @@ from sqlalchemy import text
 from pydantic import BaseModel
 from database import get_db
 from auth import get_current_user, UserContext
+from typing import Optional
 import os, httpx, json
+from datetime import datetime
 
 router = APIRouter(prefix="/review", tags=["review"])
 
@@ -19,7 +21,7 @@ class ReviewPost(BaseModel):
 
 class AutoReviewRequest(BaseModel):
     project_id: int
-    text: str
+    content: str
 
 
 class ConfirmRequest(BaseModel):
@@ -27,14 +29,65 @@ class ConfirmRequest(BaseModel):
 
 
 def _audit(db, project_id, user_name, action, target_table=None, target_id=None, detail=None):
+    detail_json = json.dumps(detail or {}, ensure_ascii=False)
     db.execute(
         text("""
             INSERT INTO audit_logs (project_id, user_name, action, target_table, target_id, detail)
-            VALUES (:p, :u, :a, :tt, :ti, :d::jsonb)
+            VALUES (:p, :u, :a, :tt, :ti, CAST(:detail AS jsonb))
         """),
         {"p": project_id, "u": user_name, "a": action, "tt": target_table,
-         "ti": target_id, "d": json.dumps(detail or {}, ensure_ascii=False)}
+         "ti": target_id, "detail": detail_json}
     )
+
+
+
+@router.post("/auto")
+async def auto_review(req: AutoReviewRequest, db: Session = Depends(get_db),
+                      user: UserContext = Depends(get_current_user)):
+    import logging
+    logger = logging.getLogger("uvicorn.error")
+    logger.info(f"[auto_review] project_id={req.project_id} content_len={len(req.content)}")
+    user.require("write")
+    ollama_url  = os.getenv("OLLAMA_URL",   "http://ollama:11434")
+    ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5")
+    system_prompt = """あなたは日本の政府IT調達のデジタル統括アドバイザーです。
+DS-110・DS-910の観点から調達仕様書・見積書をレビューし、具体的な指摘事項を200字以内で箇条書き。条文番号を明示。"""
+    payload = {
+        "model": ollama_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": req.content},
+        ],
+        "stream": False,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{ollama_url}/api/chat",
+                json=payload,
+            )
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail=f"Ollama に接続できません ({ollama_url}). docker compose exec ollama ollama pull {ollama_model} でモデルを確認してください。")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Ollama がタイムアウトしました。モデルのロード中の可能性があります。")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Ollama API error ({resp.status_code}): {resp.text[:300]}")
+    body = resp.json()
+    comment = body.get("message", {}).get("content") or body.get("response", "")
+    if not comment:
+        raise HTTPException(status_code=502, detail=f"Ollama レスポンス不正: {str(body)[:200]}")
+    ver = db.execute(
+        text("SELECT COALESCE(MAX(version),0) FROM review_logs WHERE project_id=:p"),
+        {"p": req.project_id}
+    ).scalar()
+    result = db.execute(
+        text("INSERT INTO review_logs (project_id,author,role,comment,status,version) VALUES (:p,'AI自動レビュー','AI',:c,'issue',:v) RETURNING id"),
+        {"p": req.project_id, "c": comment, "v": ver+1}
+    )
+    new_id = result.fetchone()[0]
+    _audit(db, req.project_id, "ai", "auto_review", "review_logs", new_id, {})
+    db.commit()
+    return {"status": "ok", "comment": comment, "id": new_id}
 
 
 @router.get("/{project_id}")
@@ -102,43 +155,6 @@ def confirm_review(log_id: int, req: ConfirmRequest, db: Session = Depends(get_d
     db.commit()
     return {"status": "ok", "confirmed": True}
 
-
-@router.post("/auto")
-async def auto_review(req: AutoReviewRequest, db: Session = Depends(get_db),
-                      user: UserContext = Depends(get_current_user)):
-    user.require("write")
-    ollama_url   = os.getenv("OLLAMA_URL",   "http://ollama:11434")
-    ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5")
-    system_prompt = """あなたは日本の政府IT調達のデジタル統括アドバイザーです。
-DS-110・DS-910の観点から調達仕様書・見積書をレビューし、具体的な指摘事項を200字以内で箇条書き。条文番号を明示。"""
-    payload = {
-        "model": ollama_model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": req.text},
-        ],
-        "stream": False,
-    }
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
-            f"{ollama_url}/api/chat",
-            json=payload,
-        )
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Ollama API error: {resp.text[:200]}")
-    comment = resp.json()["message"]["content"]
-    ver = db.execute(
-        text("SELECT COALESCE(MAX(version),0) FROM review_logs WHERE project_id=:p"),
-        {"p": req.project_id}
-    ).scalar()
-    result = db.execute(
-        text("INSERT INTO review_logs (project_id,author,role,comment,status,version) VALUES (:p,'AI自動レビュー','AI',:c,'issue',:v) RETURNING id"),
-        {"p": req.project_id, "c": comment, "v": ver+1}
-    )
-    new_id = result.fetchone()[0]
-    _audit(db, req.project_id, "ai", "auto_review", "review_logs", new_id, {})
-    db.commit()
-    return {"status": "ok", "comment": comment, "id": new_id}
 
 
 @router.delete("/{log_id}")

@@ -25,6 +25,7 @@ def me(user: UserContext = Depends(get_current_user)):
         "role": user.role,
         "permissions": list(
             {"read", "write", "confirm", "export", "manage"}
+            & {"read", "write", "confirm", "export", "manage"}
             if user.role == "admin"
             else {"read", "write", "confirm"} if user.role == "evaluator"
             else {"read", "write"} if user.role == "pjmo"

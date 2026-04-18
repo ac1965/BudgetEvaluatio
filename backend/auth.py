@@ -1,13 +1,16 @@
 """
 RBAC モジュール
-現在: X-User-Name / X-User-Role ヘッダーによるシンプル認証
-本番: Keycloak JWT検証に差し替え
+本番はKeycloak JWT検証に差し替える。
+現在はヘッダー X-User-Name / X-User-Role によるシンプル認証。
+X-User-Name は btoa(encodeURIComponent(name)) でBase64エンコードされている。
 """
 from fastapi import Header, HTTPException, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from database import get_db
 from typing import Optional
+import base64
+from urllib.parse import unquote
 
 ROLE_PERMISSIONS = {
     "admin":     {"read", "write", "confirm", "export", "manage"},
@@ -15,6 +18,16 @@ ROLE_PERMISSIONS = {
     "pjmo":      {"read", "write"},
     "viewer":    {"read"},
 }
+
+
+def _decode_username(raw: str) -> str:
+    """btoa(encodeURIComponent(name)) → 元の文字列に戻す"""
+    try:
+        # Base64デコード → URLデコード
+        decoded = base64.b64decode(raw + "==").decode("utf-8")
+        return unquote(decoded)
+    except Exception:
+        return raw  # デコード失敗時はそのまま使用
 
 
 class UserContext:
@@ -41,12 +54,17 @@ def get_current_user(
 ) -> UserContext:
     if not x_user_name:
         return UserContext("anonymous", "匿名ユーザー", "viewer")
+
+    username = _decode_username(x_user_name)
+
     row = db.execute(
         text("SELECT display_name, role FROM users WHERE username=:u"),
-        {"u": x_user_name}
+        {"u": username}
     ).fetchone()
+
     if row:
-        return UserContext(x_user_name, row.display_name, row.role)
+        return UserContext(username, row.display_name, row.role)
+
     valid_roles = set(ROLE_PERMISSIONS.keys())
     role = x_user_role if x_user_role in valid_roles else "viewer"
-    return UserContext(x_user_name, x_user_name, role)
+    return UserContext(username, username, role)

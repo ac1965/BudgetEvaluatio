@@ -12,7 +12,7 @@
 
 日本の政府・公共調達における予算評価レビューを支援するWebアプリケーション。
 DS-110・DS-910標準に準拠した調達審査において、評価者とPJMOの往復レビュー（ラリー）を
-構造化・履歴管理し、AIによる自動レビューと監査ログ出力を提供する。
+構造化・履歴管理し、AI（Claude API）による自動レビューと監査ログ出力を提供する。
 
 ** レビューの流れ
 
@@ -427,78 +427,158 @@ python org_tangle.py --out /tmp/pjmo-out
 ** スキーマ + サンプルデータ
 
 #+begin_src sql :tangle db/init.sql
--- RBAC
+-- ════════════════════════════════════════════════════════
+--  予算額妥当性評価システム  init.sql  v2.0
+-- ════════════════════════════════════════════════════════
+
+-- ── RBAC ─────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS users (
-    id SERIAL PRIMARY KEY,
-    username TEXT UNIQUE NOT NULL,
+    id           SERIAL PRIMARY KEY,
+    username     TEXT UNIQUE NOT NULL,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('admin', 'evaluator', 'pjmo', 'viewer')),
-    created_at TIMESTAMP DEFAULT now()
+    role         TEXT NOT NULL CHECK (role IN ('admin','evaluator','pjmo','viewer')),
+    created_at   TIMESTAMP DEFAULT now()
 );
 
--- プロジェクト
+-- ── 評価対象システム ──────────────────────────────────
+CREATE TABLE IF NOT EXISTS systems (
+    id           SERIAL PRIMARY KEY,
+    name         TEXT NOT NULL,
+    department   TEXT,
+    created_at   TIMESTAMP DEFAULT now()
+);
+
+-- ── 事業（id=0 は各システムの「システム全体」用） ─────
 CREATE TABLE IF NOT EXISTS projects (
-    id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL,
-    description TEXT,
-    created_at TIMESTAMP DEFAULT now()
+    id                SERIAL PRIMARY KEY,
+    system_id         INT REFERENCES systems(id) NOT NULL,
+    name              TEXT NOT NULL,
+    cost_category     TEXT CHECK (cost_category IN (
+                          '整備費（投資的整備）',
+                          '整備費（維持的整備）',
+                          '整備費（サービス利用料）',
+                          '運用費',
+                          '保守費'
+                      )),
+    amount_single     INTEGER DEFAULT 0,   -- 単歳要求額（千円）
+    amount_advance    INTEGER DEFAULT 0,   -- 前払金（千円）
+    amount_deferred   INTEGER DEFAULT 0,   -- 後年度負担金（千円）
+    estimate_text     TEXT,
+    estimate_file     TEXT,
+    requirements_text TEXT,
+    requirements_file TEXT,
+    basis_text        TEXT,
+    basis_file        TEXT,
+    evaluator_name    TEXT,
+    is_system_wide    BOOLEAN DEFAULT FALSE, -- TRUE: システム全体スレッド用
+    created_at        TIMESTAMP DEFAULT now()
 );
 
--- レビューログ（バージョン・確定情報付き）
-CREATE TABLE IF NOT EXISTS review_logs (
-    id SERIAL PRIMARY KEY,
-    project_id INT REFERENCES projects(id),
-    author TEXT NOT NULL,
-    role TEXT NOT NULL,
-    comment TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('issue', 'reply', 'review', 'close')),
-    version INT NOT NULL DEFAULT 1,
-    confirmed_at TIMESTAMP,
-    confirmed_by TEXT,
-    created_at TIMESTAMP DEFAULT now()
+-- ── 指摘スレッド ──────────────────────────────────────
+CREATE TABLE IF NOT EXISTS review_threads (
+    id          SERIAL PRIMARY KEY,
+    project_id  INT REFERENCES projects(id) NOT NULL,
+    thread_no   INT NOT NULL,
+    title       TEXT,
+    status      TEXT NOT NULL DEFAULT 'open'
+                CHECK (status IN ('open','replied','reviewing','closed')),
+    due_date    DATE,
+    created_at  TIMESTAMP DEFAULT now(),
+    UNIQUE (project_id, thread_no)
 );
 
--- MCP/Webhook通知ログ
+-- ── スレッド内投稿 ─────────────────────────────────────
+CREATE TABLE IF NOT EXISTS review_entries (
+    id          SERIAL PRIMARY KEY,
+    thread_id   INT REFERENCES review_threads(id) NOT NULL,
+    seq         INT NOT NULL,
+    entry_type  TEXT NOT NULL CHECK (entry_type IN ('issue','reply','review','close')),
+    role        TEXT NOT NULL CHECK (role IN ('evaluator','pjmo','ai')),
+    comment     TEXT NOT NULL,
+    entry_date  DATE,
+    created_at  TIMESTAMP DEFAULT now(),
+    UNIQUE (thread_id, seq)
+);
+
+-- ── 添付ファイル ──────────────────────────────────────
+CREATE TABLE IF NOT EXISTS project_files (
+    id          SERIAL PRIMARY KEY,
+    project_id  INT REFERENCES projects(id) NOT NULL,
+    file_type   TEXT NOT NULL CHECK (file_type IN ('estimate','requirements','basis')),
+    filename    TEXT NOT NULL,
+    filepath    TEXT NOT NULL,
+    filesize    INT,
+    created_at  TIMESTAMP DEFAULT now()
+);
+
+-- ── Webhook通知ログ ────────────────────────────────────
 CREATE TABLE IF NOT EXISTS webhook_logs (
-    id SERIAL PRIMARY KEY,
-    project_id INT REFERENCES projects(id),
-    event_type TEXT NOT NULL,
-    payload JSONB,
-    status TEXT NOT NULL DEFAULT 'pending',
-    sent_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT now()
+    id          SERIAL PRIMARY KEY,
+    project_id  INT,
+    event_type  TEXT NOT NULL,
+    payload     JSONB,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    sent_at     TIMESTAMP,
+    created_at  TIMESTAMP DEFAULT now()
 );
 
--- 監査ログ
+-- ── 監査ログ ──────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS audit_logs (
-    id SERIAL PRIMARY KEY,
-    project_id INT,
-    user_name TEXT,
-    action TEXT NOT NULL,
+    id           SERIAL PRIMARY KEY,
+    project_id   INT,
+    user_name    TEXT,
+    action       TEXT NOT NULL,
     target_table TEXT,
-    target_id INT,
-    detail JSONB,
-    created_at TIMESTAMP DEFAULT now()
+    target_id    INT,
+    detail       JSONB,
+    created_at   TIMESTAMP DEFAULT now()
 );
 
--- サンプルデータ
+-- ════════════════════════════════════════════════════════
+--  サンプルデータ
+-- ════════════════════════════════════════════════════════
 INSERT INTO users (username, display_name, role) VALUES
-    ('tanaka', '田中係長', 'evaluator'),
-    ('yamada', '山田主任', 'pjmo'),
-    ('suzuki', '鈴木部長', 'admin'),
+    ('tanaka',      '田中係長',   'evaluator'),
+    ('yamada',      '山田主任',   'pjmo'),
+    ('suzuki',      '鈴木部長',   'admin'),
     ('ai_reviewer', 'AIレビュー', 'viewer')
 ON CONFLICT DO NOTHING;
 
-INSERT INTO projects (name, description) VALUES
-    ('令和7年度 情報システム整備事業', 'DS-110準拠 調達審査対象'),
-    ('行政DX基盤構築PJ', 'DS-910準拠 クラウド移行')
+INSERT INTO systems (id, name, department) VALUES
+    (1, '人事給与システム（次期）', '人事院'),
+    (2, '行政DX基盤', 'デジタル庁')
 ON CONFLICT DO NOTHING;
 
-INSERT INTO review_logs (project_id, author, role, comment, status, version) VALUES
-    (1, '田中係長', '評価者', '積算根拠の内訳が不明確です。FP法による規模見積もりの詳細を提示してください。', 'issue', 1),
-    (1, '山田主任', 'PJMO', 'FP計算書（別紙3）を追加しました。機能点数142FP、開発工数2.8PY相当です。', 'reply', 1),
-    (1, '田中係長', '評価者', '積算根拠を確認しました。ただしクラウド移行コストの根拠が不足しています。', 'review', 1),
-    (1, 'LLMレビュー', 'AI', 'DS-110第4.2条に基づく調達仕様書確認：セキュリティ要件（第6条）の記載が不十分です。ISMAP準拠クラウドサービスの選定基準を明示してください。', 'issue', 1);
+-- システム全体スレッド用仮想事業
+INSERT INTO projects (id, system_id, name, is_system_wide) VALUES
+    (1, 1, 'システム全体', TRUE),
+    (3, 2, 'システム全体', TRUE)
+ON CONFLICT DO NOTHING;
+
+-- 通常事業
+INSERT INTO projects (id, system_id, name, cost_category, amount_single, amount_deferred, evaluator_name) VALUES
+    (2, 1, '令和8年度 整備事業', '整備費（投資的整備）', 150000, 80000, '田中係長'),
+    (4, 2, '令和8年度 クラウド移行', '整備費（サービス利用料）', 45000, 0, '田中係長')
+ON CONFLICT DO NOTHING;
+
+-- シーケンスを正しい値にリセット
+SELECT setval('systems_id_seq', (SELECT MAX(id) FROM systems));
+SELECT setval('projects_id_seq', (SELECT MAX(id) FROM projects));
+
+-- サンプルスレッドと投稿
+INSERT INTO review_threads (id, project_id, thread_no, title, status, due_date) VALUES
+    (1, 2, 1, '積算根拠の確認', 'replied', '2025-03-31'),
+    (2, 2, 2, 'Cloud by Default 対応確認', 'open', '2025-04-30')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO review_entries (thread_id, seq, entry_type, role, comment, entry_date) VALUES
+    (1, 1, 'issue',  'evaluator', 'FP法による規模見積もりの詳細を提示してください。積算根拠の内訳が不明確です。', '2025-01-10'),
+    (1, 2, 'reply',  'pjmo',      'FP計算書（別紙3）を追加しました。機能点数142FP、開発工数2.8PY相当です。', '2025-01-20'),
+    (2, 1, 'issue',  'evaluator', 'DS-110第4.2条に基づきCloud by Default原則との整合性を説明してください。', '2025-01-15')
+ON CONFLICT DO NOTHING;
+
+SELECT setval('review_threads_id_seq', (SELECT MAX(id) FROM review_threads));
+SELECT setval('review_entries_id_seq', (SELECT MAX(id) FROM review_entries));
 #+end_src
 
 * バックエンド
@@ -515,6 +595,8 @@ httpx==0.27.2
 pydantic==2.9.2
 openpyxl==3.1.5
 reportlab==4.2.5
+python-multipart==0.0.12
+aiofiles==24.1.0
 #+end_src
 
 ** Dockerfile
@@ -567,14 +649,17 @@ def get_db():
 #+begin_src python :tangle backend/auth.py
 """
 RBAC モジュール
-現在: X-User-Name / X-User-Role ヘッダーによるシンプル認証
-本番: Keycloak JWT検証に差し替え
+本番はKeycloak JWT検証に差し替える。
+現在はヘッダー X-User-Name / X-User-Role によるシンプル認証。
+X-User-Name は btoa(encodeURIComponent(name)) でBase64エンコードされている。
 """
 from fastapi import Header, HTTPException, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from database import get_db
 from typing import Optional
+import base64
+from urllib.parse import unquote
 
 ROLE_PERMISSIONS = {
     "admin":     {"read", "write", "confirm", "export", "manage"},
@@ -582,6 +667,16 @@ ROLE_PERMISSIONS = {
     "pjmo":      {"read", "write"},
     "viewer":    {"read"},
 }
+
+
+def _decode_username(raw: str) -> str:
+    """btoa(encodeURIComponent(name)) → 元の文字列に戻す"""
+    try:
+        # Base64デコード → URLデコード
+        decoded = base64.b64decode(raw + "==").decode("utf-8")
+        return unquote(decoded)
+    except Exception:
+        return raw  # デコード失敗時はそのまま使用
 
 
 class UserContext:
@@ -608,15 +703,20 @@ def get_current_user(
 ) -> UserContext:
     if not x_user_name:
         return UserContext("anonymous", "匿名ユーザー", "viewer")
+
+    username = _decode_username(x_user_name)
+
     row = db.execute(
         text("SELECT display_name, role FROM users WHERE username=:u"),
-        {"u": x_user_name}
+        {"u": username}
     ).fetchone()
+
     if row:
-        return UserContext(x_user_name, row.display_name, row.role)
+        return UserContext(username, row.display_name, row.role)
+
     valid_roles = set(ROLE_PERMISSIONS.keys())
     role = x_user_role if x_user_role in valid_roles else "viewer"
-    return UserContext(x_user_name, x_user_name, role)
+    return UserContext(username, username, role)
 #+end_src
 
 ** main.py
@@ -624,30 +724,45 @@ def get_current_user(
 #+begin_src python :tangle backend/main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from review import router as review_router
-from projects import router as projects_router
-from export_router import router as export_router
-from notify_router import router as notify_router
-from users_router import router as users_router
+from fastapi.staticfiles import StaticFiles
+import os
 
-app = FastAPI(title="PJMO Review API", version="2.0.0")
+from systems_router  import router as systems_router
+from projects_router import router as projects_router
+from threads_router  import router as threads_router
+from io_router       import router as io_router
+from advisor_router  import router as advisor_router
+from export_router   import router as export_router
+from notify_router   import router as notify_router
+from users_router    import router as users_router
+
+app = FastAPI(title="予算額妥当性評価システム API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3005"],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
-app.include_router(review_router)
+app.include_router(systems_router)
 app.include_router(projects_router)
+app.include_router(threads_router)
+app.include_router(io_router)
+app.include_router(advisor_router)
 app.include_router(export_router)
 app.include_router(notify_router)
 app.include_router(users_router)
 
+# uploads ディレクトリを静的配信
+uploads_dir = "/app/uploads"
+os.makedirs(uploads_dir, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
 
-@app.get("/health")
+
+@app.get("/api/health")
 def health():
     return {"status": "ok", "version": "2.0.0"}
 #+end_src
@@ -655,20 +770,81 @@ def health():
 ** projects.py
 
 #+begin_src python :tangle backend/projects.py
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from pydantic import BaseModel
 from database import get_db
+from auth import get_current_user, UserContext
 
 router = APIRouter(prefix="/projects", tags=["projects"])
+
+
+class ProjectCreate(BaseModel):
+    name: str
+    description: str = ""
+    category: str = "system"  # "system"（評価対象システム）/ "project"（事業）
 
 
 @router.get("/")
 def list_projects(db: Session = Depends(get_db)):
     rows = db.execute(
-        text("SELECT id, name, description FROM projects ORDER BY id")
+        text("""
+            SELECT id, name, description,
+                   COALESCE(category, 'system') AS category,
+                   to_char(created_at, 'YYYY-MM-DD') AS created_at
+            FROM projects
+            ORDER BY id
+        """)
     ).fetchall()
     return [dict(r._mapping) for r in rows]
+
+
+@router.post("/")
+def create_project(
+    data: ProjectCreate,
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_current_user),
+):
+    user.require("write")
+    if not data.name.strip():
+        raise HTTPException(status_code=400, detail="名称は必須です")
+    if data.category not in ("system", "project"):
+        raise HTTPException(status_code=400, detail="category は system または project")
+
+    result = db.execute(
+        text("""
+            INSERT INTO projects (name, description, category)
+            VALUES (:name, :desc, :cat)
+            RETURNING id
+        """),
+        {"name": data.name.strip(), "desc": data.description.strip(), "cat": data.category}
+    )
+    new_id = result.fetchone()[0]
+    db.commit()
+    return {"status": "ok", "id": new_id}
+
+
+@router.delete("/{project_id}")
+def delete_project(
+    project_id: int,
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_current_user),
+):
+    user.require("manage")
+    # レビューログが存在する場合は削除不可
+    count = db.execute(
+        text("SELECT COUNT(*) FROM review_logs WHERE project_id=:id"),
+        {"id": project_id}
+    ).scalar()
+    if count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"レビューログが {count} 件あるため削除できません"
+        )
+    db.execute(text("DELETE FROM projects WHERE id=:id"), {"id": project_id})
+    db.commit()
+    return {"status": "ok"}
 #+end_src
 
 ** users_router.py
@@ -701,6 +877,7 @@ def me(user: UserContext = Depends(get_current_user)):
         "role": user.role,
         "permissions": list(
             {"read", "write", "confirm", "export", "manage"}
+            & {"read", "write", "confirm", "export", "manage"}
             if user.role == "admin"
             else {"read", "write", "confirm"} if user.role == "evaluator"
             else {"read", "write"} if user.role == "pjmo"
@@ -718,7 +895,9 @@ from sqlalchemy import text
 from pydantic import BaseModel
 from database import get_db
 from auth import get_current_user, UserContext
+from typing import Optional
 import os, httpx, json
+from datetime import datetime
 
 router = APIRouter(prefix="/review", tags=["review"])
 
@@ -733,7 +912,7 @@ class ReviewPost(BaseModel):
 
 class AutoReviewRequest(BaseModel):
     project_id: int
-    text: str
+    content: str
 
 
 class ConfirmRequest(BaseModel):
@@ -741,14 +920,65 @@ class ConfirmRequest(BaseModel):
 
 
 def _audit(db, project_id, user_name, action, target_table=None, target_id=None, detail=None):
+    detail_json = json.dumps(detail or {}, ensure_ascii=False)
     db.execute(
         text("""
             INSERT INTO audit_logs (project_id, user_name, action, target_table, target_id, detail)
-            VALUES (:p, :u, :a, :tt, :ti, :d::jsonb)
+            VALUES (:p, :u, :a, :tt, :ti, CAST(:detail AS jsonb))
         """),
         {"p": project_id, "u": user_name, "a": action, "tt": target_table,
-         "ti": target_id, "d": json.dumps(detail or {}, ensure_ascii=False)}
+         "ti": target_id, "detail": detail_json}
     )
+
+
+
+@router.post("/auto")
+async def auto_review(req: AutoReviewRequest, db: Session = Depends(get_db),
+                      user: UserContext = Depends(get_current_user)):
+    import logging
+    logger = logging.getLogger("uvicorn.error")
+    logger.info(f"[auto_review] project_id={req.project_id} content_len={len(req.content)}")
+    user.require("write")
+    ollama_url  = os.getenv("OLLAMA_URL",   "http://ollama:11434")
+    ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5")
+    system_prompt = """あなたは日本の政府IT調達のデジタル統括アドバイザーです。
+DS-110・DS-910の観点から調達仕様書・見積書をレビューし、具体的な指摘事項を200字以内で箇条書き。条文番号を明示。"""
+    payload = {
+        "model": ollama_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": req.content},
+        ],
+        "stream": False,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{ollama_url}/api/chat",
+                json=payload,
+            )
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail=f"Ollama に接続できません ({ollama_url}). docker compose exec ollama ollama pull {ollama_model} でモデルを確認してください。")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Ollama がタイムアウトしました。モデルのロード中の可能性があります。")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Ollama API error ({resp.status_code}): {resp.text[:300]}")
+    body = resp.json()
+    comment = body.get("message", {}).get("content") or body.get("response", "")
+    if not comment:
+        raise HTTPException(status_code=502, detail=f"Ollama レスポンス不正: {str(body)[:200]}")
+    ver = db.execute(
+        text("SELECT COALESCE(MAX(version),0) FROM review_logs WHERE project_id=:p"),
+        {"p": req.project_id}
+    ).scalar()
+    result = db.execute(
+        text("INSERT INTO review_logs (project_id,author,role,comment,status,version) VALUES (:p,'AI自動レビュー','AI',:c,'issue',:v) RETURNING id"),
+        {"p": req.project_id, "c": comment, "v": ver+1}
+    )
+    new_id = result.fetchone()[0]
+    _audit(db, req.project_id, "ai", "auto_review", "review_logs", new_id, {})
+    db.commit()
+    return {"status": "ok", "comment": comment, "id": new_id}
 
 
 @router.get("/{project_id}")
@@ -817,43 +1047,6 @@ def confirm_review(log_id: int, req: ConfirmRequest, db: Session = Depends(get_d
     return {"status": "ok", "confirmed": True}
 
 
-@router.post("/auto")
-async def auto_review(req: AutoReviewRequest, db: Session = Depends(get_db),
-                      user: UserContext = Depends(get_current_user)):
-    user.require("write")
-    ollama_url   = os.getenv("OLLAMA_URL",   "http://ollama:11434")
-    ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5")
-    system_prompt = """あなたは日本の政府IT調達のデジタル統括アドバイザーです。
-DS-110・DS-910の観点から調達仕様書・見積書をレビューし、具体的な指摘事項を200字以内で箇条書き。条文番号を明示。"""
-    payload = {
-        "model": ollama_model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": req.text},
-        ],
-        "stream": False,
-    }
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
-            f"{ollama_url}/api/chat",
-            json=payload,
-        )
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Ollama API error: {resp.text[:200]}")
-    comment = resp.json()["message"]["content"]
-    ver = db.execute(
-        text("SELECT COALESCE(MAX(version),0) FROM review_logs WHERE project_id=:p"),
-        {"p": req.project_id}
-    ).scalar()
-    result = db.execute(
-        text("INSERT INTO review_logs (project_id,author,role,comment,status,version) VALUES (:p,'AI自動レビュー','AI',:c,'issue',:v) RETURNING id"),
-        {"p": req.project_id, "c": comment, "v": ver+1}
-    )
-    new_id = result.fetchone()[0]
-    _audit(db, req.project_id, "ai", "auto_review", "review_logs", new_id, {})
-    db.commit()
-    return {"status": "ok", "comment": comment, "id": new_id}
-
 
 @router.delete("/{log_id}")
 def close_review(log_id: int, db: Session = Depends(get_db),
@@ -882,12 +1075,75 @@ def get_audit(project_id: int, db: Session = Depends(get_db),
     return [dict(r._mapping) for r in rows]
 #+end_src
 
+
+** advisor_router.py（予算評価アドバイザーAPI）
+
+#+begin_src python :tangle backend/advisor_router.py
+"""
+予算額妥当性評価アドバイザー API
+Ollama /api/chat を呼び出し、対話を仲介する
+"""
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from typing import List
+from auth import get_current_user, UserContext
+import os, httpx
+
+router = APIRouter(prefix="/advisor", tags=["advisor"])
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]
+    system: str = ""
+
+
+@router.post("/chat")
+async def advisor_chat(
+    req: ChatRequest,
+    user: UserContext = Depends(get_current_user),
+):
+    user.require("read")
+    ollama_url   = os.getenv("OLLAMA_URL",   "http://ollama:11434")
+    ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5")
+
+    # systemメッセージを先頭に追加
+    msgs = []
+    if req.system:
+        msgs.append({"role": "system", "content": req.system})
+    msgs += [{"role": m.role, "content": m.content} for m in req.messages]
+
+    try:
+        async with httpx.AsyncClient(timeout=180) as client:
+            resp = await client.post(
+                f"{ollama_url}/api/chat",
+                json={"model": ollama_model, "messages": msgs, "stream": False},
+            )
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail=f"Ollama に接続できません ({ollama_url})")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Ollama がタイムアウトしました")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Ollama error: {resp.text[:200]}")
+
+    body = resp.json()
+    content = body.get("message", {}).get("content") or body.get("response", "")
+    if not content:
+        raise HTTPException(status_code=502, detail="Ollama レスポンス不正")
+
+    return {"content": content, "model": ollama_model}
+#+end_src
+
 ** export_router.py
 
 #+begin_src python :tangle backend/export_router.py
 """
 監査ログ エクスポート（Excel / PDF）
-evaluator / admin のみ実行可
 """
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -919,8 +1175,11 @@ def _fetch_logs(project_id: int, db: Session):
 
 
 @router.get("/{project_id}/excel")
-def export_excel(project_id: int, db: Session = Depends(get_db),
-                 user: UserContext = Depends(get_current_user)):
+def export_excel(
+    project_id: int,
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_current_user),
+):
     user.require("export")
     try:
         from openpyxl import Workbook
@@ -937,6 +1196,7 @@ def export_excel(project_id: int, db: Session = Depends(get_db),
     ws = wb.active
     ws.title = "レビューラリー"
 
+    # ── スタイル定義
     STATUS_FILL = {
         "issue":  PatternFill("solid", fgColor="FCE4EC"),
         "reply":  PatternFill("solid", fgColor="E8F5E9"),
@@ -947,20 +1207,25 @@ def export_excel(project_id: int, db: Session = Depends(get_db),
     HEADER_FILL = PatternFill("solid", fgColor="1A2340")
     thin = Side(style="thin", color="CCCCCC")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
     headers = ["#", "日時", "バージョン", "役割", "氏名", "種別", "コメント", "確定者", "確定日時"]
     col_widths = [5, 16, 10, 10, 14, 8, 60, 14, 18]
 
+    # タイトル行
     project_name = logs[0]["project_name"]
     ws.merge_cells("A1:I1")
-    ws["A1"].value = f"レビューラリー監査ログ：{project_name}"
-    ws["A1"].font = Font(bold=True, size=13, name="Meiryo")
-    ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
+    title_cell = ws["A1"]
+    title_cell.value = f"レビューラリー監査ログ：{project_name}"
+    title_cell.font = Font(bold=True, size=13, name="Meiryo")
+    title_cell.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[1].height = 24
+
     ws.merge_cells("A2:I2")
     ws["A2"].value = f"出力日時：{datetime.now().strftime('%Y-%m-%d %H:%M')}　件数：{len(logs)}件"
     ws["A2"].font = Font(size=9, color="666666", name="Meiryo")
     ws.row_dimensions[2].height = 16
 
+    # ヘッダー行
     for col, (h, w) in enumerate(zip(headers, col_widths), 1):
         cell = ws.cell(row=3, column=col, value=h)
         cell.font = HEADER_FONT
@@ -971,13 +1236,22 @@ def export_excel(project_id: int, db: Session = Depends(get_db),
     ws.row_dimensions[3].height = 20
 
     STATUS_LABEL = {"issue": "指摘", "reply": "回答", "review": "再評価", "close": "確定"}
+
     for i, log in enumerate(logs, 1):
         row = i + 3
-        values = [i, log["created_at"], f"v{log['version']}", log["role"], log["author"],
-                  STATUS_LABEL.get(log["status"], log["status"]), log["comment"],
-                  log["confirmed_by"] or "", log["confirmed_at"] or ""]
+        values = [
+            i,
+            log["created_at"],
+            f"v{log['version']}",
+            log["role"],
+            log["author"],
+            STATUS_LABEL.get(log["status"], log["status"]),
+            log["comment"],
+            log["confirmed_by"] or "",
+            log["confirmed_at"] or "",
+        ]
         fill = STATUS_FILL.get(log["status"], PatternFill())
-        aligns = ["center","center","center","center","center","center","left","center","center"]
+        aligns = ["center", "center", "center", "center", "center", "center", "left", "center", "center"]
         for col, (val, align) in enumerate(zip(values, aligns), 1):
             cell = ws.cell(row=row, column=col, value=val)
             cell.fill = fill
@@ -989,9 +1263,12 @@ def export_excel(project_id: int, db: Session = Depends(get_db),
     ws.freeze_panes = "A4"
     ws.auto_filter.ref = f"A3:I{len(logs)+3}"
 
+    # 監査シート
     ws2 = wb.create_sheet("監査メタ")
-    ws2["A1"] = "項目"; ws2["B1"] = "値"
-    ws2["A1"].font = Font(bold=True); ws2["B1"].font = Font(bold=True)
+    ws2["A1"] = "項目"
+    ws2["B1"] = "値"
+    ws2["A1"].font = Font(bold=True)
+    ws2["B1"].font = Font(bold=True)
     meta = [
         ("プロジェクト", project_name),
         ("出力日時", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
@@ -1001,11 +1278,13 @@ def export_excel(project_id: int, db: Session = Depends(get_db),
         ("確定件数", sum(1 for l in logs if l["status"] == "close")),
     ]
     for r, (k, v) in enumerate(meta, 2):
-        ws2[f"A{r}"] = k; ws2[f"B{r}"] = v
+        ws2[f"A{r}"] = k
+        ws2[f"B{r}"] = v
 
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
+
     filename = f"review_log_pj{project_id}_{datetime.now().strftime('%Y%m%d%H%M')}.xlsx"
     return StreamingResponse(
         buf,
@@ -1015,15 +1294,21 @@ def export_excel(project_id: int, db: Session = Depends(get_db),
 
 
 @router.get("/{project_id}/pdf")
-def export_pdf(project_id: int, db: Session = Depends(get_db),
-               user: UserContext = Depends(get_current_user)):
+def export_pdf(
+    project_id: int,
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_current_user),
+):
     user.require("export")
     try:
         from reportlab.lib.pagesizes import A4
-        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import mm
         from reportlab.lib import colors
-        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
+        from reportlab.platypus import (
+            SimpleDocTemplate, Table, TableStyle, Paragraph,
+            Spacer, HRFlowable
+        )
         from reportlab.pdfbase import pdfmetrics
         from reportlab.pdfbase.cidfonts import UnicodeCIDFont
     except ImportError:
@@ -1033,12 +1318,17 @@ def export_pdf(project_id: int, db: Session = Depends(get_db),
     if not logs:
         raise HTTPException(status_code=404, detail="レビューログなし")
 
+    # CIDフォント登録（日本語対応）
     pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
     FONT = "HeiseiKakuGo-W5"
+
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4,
-                            leftMargin=15*mm, rightMargin=15*mm,
-                            topMargin=20*mm, bottomMargin=20*mm)
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=15*mm, rightMargin=15*mm,
+        topMargin=20*mm, bottomMargin=20*mm
+    )
+
     STATUS_LABEL = {"issue": "指摘", "reply": "回答", "review": "再評価", "close": "確定"}
     STATUS_COLOR = {
         "issue":  colors.HexColor("#FCE4EC"),
@@ -1046,46 +1336,68 @@ def export_pdf(project_id: int, db: Session = Depends(get_db),
         "review": colors.HexColor("#FFF9C4"),
         "close":  colors.HexColor("#F5F5F5"),
     }
+
+    styles = getSampleStyleSheet()
     title_style = ParagraphStyle("title", fontName=FONT, fontSize=14, spaceAfter=4)
-    sub_style   = ParagraphStyle("sub",   fontName=FONT, fontSize=8, textColor=colors.grey)
-    cell_style  = ParagraphStyle("cell",  fontName=FONT, fontSize=7.5, leading=11)
+    sub_style = ParagraphStyle("sub", fontName=FONT, fontSize=8, textColor=colors.grey)
+    cell_style = ParagraphStyle("cell", fontName=FONT, fontSize=7.5, leading=11)
 
     project_name = logs[0]["project_name"]
     story = [
-        Paragraph("レビューラリー監査ログ", title_style),
+        Paragraph(f"レビューラリー監査ログ", title_style),
         Paragraph(f"対象PJ：{project_name}　出力日時：{datetime.now().strftime('%Y-%m-%d %H:%M')}　件数：{len(logs)}件", sub_style),
         Spacer(1, 4*mm),
         HRFlowable(width="100%", thickness=1, color=colors.HexColor("#1A2340")),
         Spacer(1, 3*mm),
     ]
-    table_data = [["#", "日時", "役割/氏名", "種別", "コメント"]]
+
+    # テーブルデータ
+    header_row = ["#", "日時", "役割/氏名", "種別", "コメント"]
+    table_data = [header_row]
+    row_colors = [colors.HexColor("#1A2340")]
+
     for i, log in enumerate(logs, 1):
+        comment_para = Paragraph(log["comment"], cell_style)
+        role_text = log['role'] + chr(10) + log['author']
+        role_para = Paragraph(role_text, cell_style)
         table_data.append([
-            str(i), log["created_at"],
-            Paragraph(f"{log['role']}\n{log['author']}", cell_style),
+            str(i),
+            log["created_at"],
+            role_para,
             STATUS_LABEL.get(log["status"], log["status"]),
-            Paragraph(log["comment"], cell_style),
+            comment_para,
         ])
-    t = Table(table_data, colWidths=[10*mm, 28*mm, 24*mm, 14*mm, None], repeatRows=1)
-    t.setStyle(TableStyle([
+        row_colors.append(STATUS_COLOR.get(log["status"], colors.white))
+
+    col_widths_pt = [10*mm, 28*mm, 24*mm, 14*mm, None]
+    t = Table(table_data, colWidths=col_widths_pt, repeatRows=1)
+
+    style_cmds = [
         ("FONTNAME",    (0, 0), (-1, -1), FONT),
         ("FONTSIZE",    (0, 0), (-1, -1), 7.5),
+        ("FONTNAME",    (0, 0), (-1, 0),  FONT),
+        ("FONTSIZE",    (0, 0), (-1, 0),  8),
         ("TEXTCOLOR",   (0, 0), (-1, 0),  colors.white),
         ("BACKGROUND",  (0, 0), (-1, 0),  colors.HexColor("#1A2340")),
+        ("ALIGN",       (0, 0), (-1, -1), "LEFT"),
         ("ALIGN",       (0, 0), (3, -1),  "CENTER"),
         ("VALIGN",      (0, 0), (-1, -1), "TOP"),
         ("GRID",        (0, 0), (-1, -1), 0.4, colors.HexColor("#CCCCCC")),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [STATUS_COLOR.get(l["status"], colors.white) for l in logs]),
-        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("TOPPADDING",  (0, 0), (-1, -1), 3),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-        ("LEFTPADDING",   (0, 0), (-1, -1), 4),
-    ]))
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+    ]
+    t.setStyle(TableStyle(style_cmds))
     story.append(t)
+
     doc.build(story)
     buf.seek(0)
+
     filename = f"review_log_pj{project_id}_{datetime.now().strftime('%Y%m%d%H%M')}.pdf"
     return StreamingResponse(
-        buf, media_type="application/pdf",
+        buf,
+        media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
     )
 #+end_src
@@ -1094,22 +1406,35 @@ def export_pdf(project_id: int, db: Session = Depends(get_db),
 
 #+begin_src python :tangle backend/notify_router.py
 """
-A2A/MCP連携 通知モジュール
-Agent Card（JSON-LD / schema.org）形式でイベントを外部に通知
+④ A2A/MCP連携 通知モジュール
+
+対応通知先:
+  - Webhook URL（汎用 POST）
+  - MCP Agent Card 形式（JSON-LD）
+  - （拡張）メール送信プレースホルダ
 """
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from pydantic import BaseModel
 from database import get_db
 from auth import get_current_user, UserContext
 import os, httpx, json
 from datetime import datetime
 
 router = APIRouter(prefix="/notify", tags=["notify"])
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # e.g. Slack incoming webhook / Teams / custom
 
 
+# ────────────────────────────────────────────────
+# MCP Agent Card 形式ペイロード生成
+# ────────────────────────────────────────────────
 def build_agent_card(event_type: str, log: dict, project_name: str) -> dict:
+    """
+    A2A互換 Agent Card 形式で通知ペイロードを生成。
+    受信側が MCP エージェントでも汎用 REST でも処理できる形式。
+    """
     STATUS_LABEL = {"issue": "指摘", "reply": "回答", "review": "再評価", "close": "確定"}
     return {
         "@context": "https://schema.org",
@@ -1117,72 +1442,902 @@ def build_agent_card(event_type: str, log: dict, project_name: str) -> dict:
         "identifier": f"pjmo-review-{log['id']}",
         "name": f"[{STATUS_LABEL.get(log['status'], log['status'])}] {project_name}",
         "description": log["comment"][:200],
-        "agent": {"@type": "Person", "name": log["author"], "jobTitle": log["role"]},
-        "object": {"@type": "GovernmentService", "name": project_name},
+        "agent": {
+            "@type": "Person",
+            "name": log["author"],
+            "jobTitle": log["role"]
+        },
+        "object": {
+            "@type": "GovernmentService",
+            "name": project_name,
+        },
         "actionStatus": event_type,
         "startTime": log.get("created_at", ""),
         "pjmo_metadata": {
-            "project_id": log["project_id"], "log_id": log["id"],
-            "status": log["status"], "version": log.get("version", 1),
+            "project_id": log["project_id"],
+            "log_id": log["id"],
+            "status": log["status"],
+            "version": log.get("version", 1),
         }
     }
 
 
 async def _send_webhook(payload: dict, project_id: int, event_type: str, db: Session):
+    """バックグラウンドでWebhook送信し webhook_logs に記録"""
     if not WEBHOOK_URL:
         return
+
     sent_at = None
     status = "failed"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(WEBHOOK_URL, json=payload,
-                                     headers={"Content-Type": "application/json"})
+            resp = await client.post(
+                WEBHOOK_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
         status = "sent" if resp.status_code < 400 else "failed"
         sent_at = datetime.now()
     except Exception as e:
         status = f"error: {str(e)[:100]}"
+
     db.execute(
         text("""
             INSERT INTO webhook_logs (project_id, event_type, payload, status, sent_at)
-            VALUES (:p, :e, :payload::jsonb, :s, :t)
+            VALUES (:p, :e, CAST(:payload AS jsonb), :s, :t)
         """),
-        {"p": project_id, "e": event_type,
-         "payload": json.dumps(payload, ensure_ascii=False), "s": status, "t": sent_at}
+        {
+            "p": project_id,
+            "e": event_type,
+            "payload": json.dumps(payload, ensure_ascii=False),
+            "s": status,
+            "t": sent_at,
+        }
     )
     db.commit()
 
 
+# ────────────────────────────────────────────────
+# API
+# ────────────────────────────────────────────────
+
 @router.post("/review/{log_id}")
-async def notify_review(log_id: int, background_tasks: BackgroundTasks,
-                        db: Session = Depends(get_db),
-                        user: UserContext = Depends(get_current_user)):
+async def notify_review(
+    log_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_current_user),
+):
+    """指定ログを Webhook/MCP 通知する"""
     user.require("write")
+
     row = db.execute(
-        text("SELECT r.*, p.name AS project_name FROM review_logs r JOIN projects p ON p.id=r.project_id WHERE r.id=:id"),
+        text("""
+            SELECT r.*, p.name AS project_name
+            FROM review_logs r
+            JOIN projects p ON p.id = r.project_id
+            WHERE r.id = :id
+        """),
         {"id": log_id}
     ).fetchone()
+
     if not row:
         raise HTTPException(status_code=404, detail="ログが見つかりません")
+
     log = dict(row._mapping)
     payload = build_agent_card("review_posted", log, log["project_name"])
     background_tasks.add_task(_send_webhook, payload, log["project_id"], "review_posted", db)
+
     return {"status": "queued", "payload_preview": payload}
 
 
 @router.get("/logs/{project_id}")
-def get_webhook_logs(project_id: int, db: Session = Depends(get_db),
-                     user: UserContext = Depends(get_current_user)):
+def get_webhook_logs(
+    project_id: int,
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_current_user),
+):
+    """Webhook送信履歴取得"""
     user.require("read")
     rows = db.execute(
         text("""
             SELECT id, event_type, status,
                    to_char(created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
                    to_char(sent_at, 'YYYY-MM-DD HH24:MI') AS sent_at
-            FROM webhook_logs WHERE project_id=:p ORDER BY created_at DESC LIMIT 50
+            FROM webhook_logs
+            WHERE project_id = :p
+            ORDER BY created_at DESC
+            LIMIT 50
         """),
         {"p": project_id}
     ).fetchall()
     return [dict(r._mapping) for r in rows]
+#+end_src
+
+** systems_router.py
+
+#+begin_src python :tangle backend/systems_router.py
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from pydantic import BaseModel
+from typing import Optional
+from database import get_db
+from auth import get_current_user, UserContext
+import json
+
+router = APIRouter(prefix="/systems", tags=["systems"])
+
+
+class SystemCreate(BaseModel):
+    name: str
+    department: Optional[str] = ""
+
+
+class SystemUpdate(BaseModel):
+    name: Optional[str] = None
+    department: Optional[str] = None
+
+
+def _audit(db, user_name, action, target_id=None, detail=None):
+    db.execute(
+        text("""INSERT INTO audit_logs (user_name, action, target_table, target_id, detail)
+                VALUES (:u, :a, 'systems', :ti, CAST(:d AS jsonb))"""),
+        {"u": user_name, "a": action, "ti": target_id,
+         "d": json.dumps(detail or {}, ensure_ascii=False)}
+    )
+
+
+@router.get("/")
+def list_systems(db: Session = Depends(get_db),
+                 user: UserContext = Depends(get_current_user)):
+    user.require("read")
+    rows = db.execute(text("""
+        SELECT s.id, s.name, s.department,
+               to_char(s.created_at,'YYYY-MM-DD') AS created_at,
+               COUNT(DISTINCT p.id) FILTER (WHERE p.is_system_wide = FALSE) AS project_count,
+               COUNT(DISTINCT rt.id) AS thread_count,
+               COUNT(DISTINCT rt.id) FILTER (WHERE rt.status != 'closed') AS open_count
+        FROM systems s
+        LEFT JOIN projects p ON p.system_id = s.id
+        LEFT JOIN review_threads rt ON rt.project_id = p.id
+        GROUP BY s.id ORDER BY s.id
+    """)).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+@router.post("/")
+def create_system(data: SystemCreate, db: Session = Depends(get_db),
+                  user: UserContext = Depends(get_current_user)):
+    user.require("write")
+    if not data.name.strip():
+        raise HTTPException(400, "システム名は必須です")
+    row = db.execute(
+        text("INSERT INTO systems (name, department) VALUES (:n,:d) RETURNING id"),
+        {"n": data.name.strip(), "d": data.department}
+    ).fetchone()
+    sys_id = row[0]
+    # システム全体スレッド用仮想事業を自動作成
+    db.execute(
+        text("INSERT INTO projects (system_id, name, is_system_wide) VALUES (:s,'システム全体',TRUE)"),
+        {"s": sys_id}
+    )
+    _audit(db, user.username, "create_system", sys_id, {"name": data.name})
+    db.commit()
+    return {"status": "ok", "id": sys_id}
+
+
+@router.put("/{system_id}")
+def update_system(system_id: int, data: SystemUpdate,
+                  db: Session = Depends(get_db),
+                  user: UserContext = Depends(get_current_user)):
+    user.require("write")
+    row = db.execute(text("SELECT id FROM systems WHERE id=:id"), {"id": system_id}).fetchone()
+    if not row:
+        raise HTTPException(404, "システムが見つかりません")
+    updates = {}
+    if data.name is not None:
+        updates["name"] = data.name.strip()
+    if data.department is not None:
+        updates["department"] = data.department
+    if updates:
+        sets = ", ".join(f"{k}=:{k}" for k in updates)
+        db.execute(text(f"UPDATE systems SET {sets} WHERE id=:id"),
+                   {**updates, "id": system_id})
+    _audit(db, user.username, "update_system", system_id, updates)
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.delete("/{system_id}")
+def delete_system(system_id: int, db: Session = Depends(get_db),
+                  user: UserContext = Depends(get_current_user)):
+    user.require("manage")
+    cnt = db.execute(
+        text("SELECT COUNT(*) FROM projects WHERE system_id=:s AND is_system_wide=FALSE"),
+        {"s": system_id}
+    ).scalar()
+    if cnt > 0:
+        raise HTTPException(400, f"事業が{cnt}件あるため削除できません")
+    db.execute(text("DELETE FROM projects WHERE system_id=:s"), {"s": system_id})
+    db.execute(text("DELETE FROM systems WHERE id=:s"), {"s": system_id})
+    _audit(db, user.username, "delete_system", system_id, {})
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.get("/{system_id}/projects")
+def list_projects(system_id: int, db: Session = Depends(get_db),
+                  user: UserContext = Depends(get_current_user)):
+    user.require("read")
+    rows = db.execute(text("""
+        SELECT p.id, p.name, p.cost_category, p.is_system_wide,
+               p.amount_single, p.amount_advance, p.amount_deferred,
+               p.evaluator_name,
+               p.estimate_text, p.requirements_text, p.basis_text,
+               to_char(p.created_at,'YYYY-MM-DD') AS created_at,
+               COUNT(DISTINCT rt.id) AS thread_count,
+               COUNT(DISTINCT rt.id) FILTER (WHERE rt.status!='closed') AS open_count
+        FROM projects p
+        LEFT JOIN review_threads rt ON rt.project_id = p.id
+        WHERE p.system_id = :s
+        GROUP BY p.id
+        ORDER BY p.is_system_wide DESC, p.id
+    """), {"s": system_id}).fetchall()
+    return [dict(r._mapping) for r in rows]
+#+end_src
+
+** projects_router.py
+
+#+begin_src python :tangle backend/projects_router.py
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from pydantic import BaseModel
+from typing import Optional
+from database import get_db
+from auth import get_current_user, UserContext
+import json, os, shutil
+
+router = APIRouter(prefix="/projects", tags=["projects"])
+UPLOAD_DIR = "/app/uploads"
+
+
+class ProjectCreate(BaseModel):
+    system_id: int
+    name: str
+    cost_category: Optional[str] = None
+    amount_single: int = 0
+    amount_advance: int = 0
+    amount_deferred: int = 0
+    evaluator_name: Optional[str] = None
+    estimate_text: Optional[str] = None
+    requirements_text: Optional[str] = None
+    basis_text: Optional[str] = None
+
+
+class ProjectUpdate(BaseModel):
+    name: Optional[str] = None
+    cost_category: Optional[str] = None
+    amount_single: Optional[int] = None
+    amount_advance: Optional[int] = None
+    amount_deferred: Optional[int] = None
+    evaluator_name: Optional[str] = None
+    estimate_text: Optional[str] = None
+    requirements_text: Optional[str] = None
+    basis_text: Optional[str] = None
+
+
+VALID_CATEGORIES = {
+    '整備費（投資的整備）', '整備費（維持的整備）',
+    '整備費（サービス利用料）', '運用費', '保守費'
+}
+
+
+def _audit(db, project_id, user_name, action, detail=None):
+    db.execute(
+        text("""INSERT INTO audit_logs (project_id, user_name, action, target_table, detail)
+                VALUES (:p, :u, :a, 'projects', CAST(:d AS jsonb))"""),
+        {"p": project_id, "u": user_name, "a": action,
+         "d": json.dumps(detail or {}, ensure_ascii=False)}
+    )
+
+
+@router.post("/")
+def create_project(data: ProjectCreate, db: Session = Depends(get_db),
+                   user: UserContext = Depends(get_current_user)):
+    user.require("write")
+    if not data.name.strip():
+        raise HTTPException(400, "事業名は必須です")
+    if data.cost_category and data.cost_category not in VALID_CATEGORIES:
+        raise HTTPException(400, f"無効な経費区分: {data.cost_category}")
+    row = db.execute(text("""
+        INSERT INTO projects
+          (system_id, name, cost_category, amount_single, amount_advance, amount_deferred,
+           evaluator_name, estimate_text, requirements_text, basis_text)
+        VALUES (:s,:n,:cc,:as,:aa,:ad,:en,:et,:rt,:bt)
+        RETURNING id
+    """), {"s": data.system_id, "n": data.name.strip(), "cc": data.cost_category,
+           "as": data.amount_single, "aa": data.amount_advance, "ad": data.amount_deferred,
+           "en": data.evaluator_name, "et": data.estimate_text,
+           "rt": data.requirements_text, "bt": data.basis_text}).fetchone()
+    new_id = row[0]
+    _audit(db, new_id, user.username, "create_project", {"name": data.name})
+    db.commit()
+    return {"status": "ok", "id": new_id}
+
+
+@router.put("/{project_id}")
+def update_project(project_id: int, data: ProjectUpdate,
+                   db: Session = Depends(get_db),
+                   user: UserContext = Depends(get_current_user)):
+    user.require("write")
+    row = db.execute(text("SELECT id, is_system_wide FROM projects WHERE id=:id"),
+                     {"id": project_id}).fetchone()
+    if not row:
+        raise HTTPException(404, "事業が見つかりません")
+    if row.is_system_wide:
+        raise HTTPException(400, "システム全体は編集できません")
+    if data.cost_category and data.cost_category not in VALID_CATEGORIES:
+        raise HTTPException(400, f"無効な経費区分: {data.cost_category}")
+
+    fields = {k: v for k, v in data.model_dump().items() if v is not None}
+    if fields:
+        sets = ", ".join(f"{k}=:{k}" for k in fields)
+        db.execute(text(f"UPDATE projects SET {sets} WHERE id=:id"),
+                   {**fields, "id": project_id})
+    _audit(db, project_id, user.username, "update_project", fields)
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.delete("/{project_id}")
+def delete_project(project_id: int, db: Session = Depends(get_db),
+                   user: UserContext = Depends(get_current_user)):
+    user.require("manage")
+    cnt = db.execute(
+        text("SELECT COUNT(*) FROM review_threads WHERE project_id=:id"),
+        {"id": project_id}
+    ).scalar()
+    if cnt > 0:
+        raise HTTPException(400, f"スレッドが{cnt}件あるため削除できません")
+    db.execute(text("DELETE FROM project_files WHERE project_id=:id"), {"id": project_id})
+    db.execute(text("DELETE FROM projects WHERE id=:id"), {"id": project_id})
+    _audit(db, project_id, user.username, "delete_project", {})
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.post("/{project_id}/files")
+async def upload_file(project_id: int, file_type: str,
+                      file: UploadFile = File(...),
+                      db: Session = Depends(get_db),
+                      user: UserContext = Depends(get_current_user)):
+    user.require("write")
+    if file_type not in ("estimate", "requirements", "basis"):
+        raise HTTPException(400, "file_type は estimate/requirements/basis のいずれか")
+    allowed_ext = {".pdf", ".docx", ".xlsx", ".pptx", ".txt"}
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in allowed_ext:
+        raise HTTPException(400, f"許可されていない拡張子: {ext}")
+
+    dest_dir = os.path.join(UPLOAD_DIR, str(project_id), file_type)
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, file.filename)
+
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(400, "ファイルサイズは10MB以下にしてください")
+    with open(dest_path, "wb") as f:
+        f.write(content)
+
+    db.execute(text("""
+        INSERT INTO project_files (project_id, file_type, filename, filepath, filesize)
+        VALUES (:p, :ft, :fn, :fp, :fs)
+    """), {"p": project_id, "ft": file_type, "fn": file.filename,
+           "fp": dest_path, "fs": len(content)})
+    db.commit()
+    return {"status": "ok", "filename": file.filename, "size": len(content)}
+
+
+@router.get("/{project_id}/files")
+def list_files(project_id: int, db: Session = Depends(get_db),
+               user: UserContext = Depends(get_current_user)):
+    user.require("read")
+    rows = db.execute(text("""
+        SELECT id, file_type, filename, filesize,
+               to_char(created_at,'YYYY-MM-DD HH24:MI') AS created_at
+        FROM project_files WHERE project_id=:p ORDER BY created_at
+    """), {"p": project_id}).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+@router.delete("/{project_id}/files/{file_id}")
+def delete_file(project_id: int, file_id: int,
+                db: Session = Depends(get_db),
+                user: UserContext = Depends(get_current_user)):
+    user.require("write")
+    row = db.execute(text("SELECT filepath FROM project_files WHERE id=:id AND project_id=:p"),
+                     {"id": file_id, "p": project_id}).fetchone()
+    if not row:
+        raise HTTPException(404, "ファイルが見つかりません")
+    try:
+        if os.path.exists(row.filepath):
+            os.remove(row.filepath)
+    except Exception:
+        pass
+    db.execute(text("DELETE FROM project_files WHERE id=:id"), {"id": file_id})
+    db.commit()
+    return {"status": "ok"}
+#+end_src
+
+** threads_router.py
+
+#+begin_src python :tangle backend/threads_router.py
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from pydantic import BaseModel
+from typing import Optional
+from database import get_db
+from auth import get_current_user, UserContext
+import json, os, httpx
+
+router = APIRouter(prefix="/threads", tags=["threads"])
+
+
+class ThreadCreate(BaseModel):
+    project_id: int
+    title: Optional[str] = None
+    comment: str
+    due_date: Optional[str] = None  # YYYY-MM-DD
+    entry_date: Optional[str] = None
+
+
+class EntryCreate(BaseModel):
+    entry_type: str   # reply | review | close
+    comment: str
+    entry_date: Optional[str] = None
+
+
+class DueUpdate(BaseModel):
+    due_date: Optional[str] = None
+
+
+class AutoThreadRequest(BaseModel):
+    project_id: int
+    content: str
+    title: Optional[str] = "AI自動指摘"
+
+
+def _audit(db, project_id, user_name, action, target_id=None, detail=None):
+    db.execute(
+        text("""INSERT INTO audit_logs (project_id, user_name, action, target_table, target_id, detail)
+                VALUES (:p, :u, :a, 'review_threads', :ti, CAST(:d AS jsonb))"""),
+        {"p": project_id, "u": user_name, "a": action, "ti": target_id,
+         "d": json.dumps(detail or {}, ensure_ascii=False)}
+    )
+
+
+def _next_thread_no(db, project_id: int) -> int:
+    n = db.execute(
+        text("SELECT COALESCE(MAX(thread_no),0)+1 FROM review_threads WHERE project_id=:p"),
+        {"p": project_id}
+    ).scalar()
+    return n
+
+
+def _next_seq(db, thread_id: int) -> int:
+    n = db.execute(
+        text("SELECT COALESCE(MAX(seq),0)+1 FROM review_entries WHERE thread_id=:t"),
+        {"t": thread_id}
+    ).scalar()
+    return n
+
+
+def _update_thread_status(db, thread_id: int, entry_type: str):
+    status_map = {
+        "issue":  "open",
+        "reply":  "replied",
+        "review": "reviewing",
+        "close":  "closed",
+    }
+    new_status = status_map.get(entry_type)
+    if new_status:
+        db.execute(text("UPDATE review_threads SET status=:s WHERE id=:id"),
+                   {"s": new_status, "id": thread_id})
+
+
+@router.get("/{project_id}")
+def list_threads(project_id: int, db: Session = Depends(get_db),
+                 user: UserContext = Depends(get_current_user)):
+    user.require("read")
+    threads = db.execute(text("""
+        SELECT t.id, t.thread_no, t.title, t.status, t.due_date,
+               to_char(t.created_at,'YYYY-MM-DD') AS created_at,
+               COUNT(e.id) AS entry_count,
+               MAX(to_char(e.created_at,'YYYY-MM-DD HH24:MI')) AS last_activity
+        FROM review_threads t
+        LEFT JOIN review_entries e ON e.thread_id = t.id
+        WHERE t.project_id = :p
+        GROUP BY t.id
+        ORDER BY t.thread_no
+    """), {"p": project_id}).fetchall()
+    return [dict(r._mapping) for r in threads]
+
+
+@router.post("/")
+def create_thread(data: ThreadCreate, db: Session = Depends(get_db),
+                  user: UserContext = Depends(get_current_user)):
+    user.require("write")
+    if not data.comment.strip():
+        raise HTTPException(400, "コメントは必須です")
+    thread_no = _next_thread_no(db, data.project_id)
+    t = db.execute(text("""
+        INSERT INTO review_threads (project_id, thread_no, title, status, due_date)
+        VALUES (:p, :tn, :ti, 'open', :dd) RETURNING id
+    """), {"p": data.project_id, "tn": thread_no,
+           "ti": data.title, "dd": data.due_date}).fetchone()
+    thread_id = t[0]
+    db.execute(text("""
+        INSERT INTO review_entries (thread_id, seq, entry_type, role, comment, entry_date)
+        VALUES (:t, 1, 'issue', 'evaluator', :c, :ed)
+    """), {"t": thread_id, "c": data.comment.strip(), "ed": data.entry_date})
+    _audit(db, data.project_id, user.username, "create_thread", thread_id,
+           {"thread_no": thread_no, "title": data.title})
+    db.commit()
+    return {"status": "ok", "id": thread_id, "thread_no": thread_no}
+
+
+@router.put("/{thread_id}/due")
+def update_due(thread_id: int, data: DueUpdate,
+               db: Session = Depends(get_db),
+               user: UserContext = Depends(get_current_user)):
+    user.require("write")
+    row = db.execute(text("SELECT project_id FROM review_threads WHERE id=:id"),
+                     {"id": thread_id}).fetchone()
+    if not row:
+        raise HTTPException(404, "スレッドが見つかりません")
+    db.execute(text("UPDATE review_threads SET due_date=:d WHERE id=:id"),
+               {"d": data.due_date, "id": thread_id})
+    _audit(db, row.project_id, user.username, "update_due", thread_id,
+           {"due_date": data.due_date})
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.get("/{thread_id}/entries")
+def list_entries(thread_id: int, db: Session = Depends(get_db),
+                 user: UserContext = Depends(get_current_user)):
+    user.require("read")
+    rows = db.execute(text("""
+        SELECT id, seq, entry_type, role, comment, entry_date,
+               to_char(created_at,'YYYY-MM-DD HH24:MI') AS created_at
+        FROM review_entries
+        WHERE thread_id=:t
+        ORDER BY seq
+    """), {"t": thread_id}).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+@router.post("/{thread_id}/entries")
+def add_entry(thread_id: int, data: EntryCreate,
+              db: Session = Depends(get_db),
+              user: UserContext = Depends(get_current_user)):
+    user.require("write")
+    if data.entry_type not in ("reply", "review", "close"):
+        raise HTTPException(400, "entry_type は reply/review/close のいずれか")
+
+    t = db.execute(text("SELECT project_id, status FROM review_threads WHERE id=:id"),
+                   {"id": thread_id}).fetchone()
+    if not t:
+        raise HTTPException(404, "スレッドが見つかりません")
+    if t.status == "closed":
+        raise HTTPException(400, "確定済みスレッドには投稿できません")
+
+    role = "pjmo" if data.entry_type == "reply" else "evaluator"
+    seq = _next_seq(db, thread_id)
+    db.execute(text("""
+        INSERT INTO review_entries (thread_id, seq, entry_type, role, comment, entry_date)
+        VALUES (:t, :s, :et, :r, :c, :ed)
+    """), {"t": thread_id, "s": seq, "et": data.entry_type,
+           "r": role, "c": data.comment.strip(), "ed": data.entry_date})
+    _update_thread_status(db, thread_id, data.entry_type)
+    _audit(db, t.project_id, user.username, "add_entry", thread_id,
+           {"entry_type": data.entry_type, "seq": seq})
+    db.commit()
+    return {"status": "ok", "seq": seq}
+
+
+@router.post("/auto")
+async def auto_thread(data: AutoThreadRequest, db: Session = Depends(get_db),
+                      user: UserContext = Depends(get_current_user)):
+    user.require("write")
+    ollama_url   = os.getenv("OLLAMA_URL",   "http://ollama:11434")
+    ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5")
+
+    system_prompt = """あなたは日本の政府IT調達のデジタル統括アドバイザーです。
+DS-110・DS-910の観点から調達仕様書・見積書をレビューし、具体的な指摘事項を200字以内で記述してください。根拠条項を明示してください。"""
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{ollama_url}/api/chat",
+                json={"model": ollama_model, "stream": False,
+                      "messages": [
+                          {"role": "system", "content": system_prompt},
+                          {"role": "user",   "content": data.content}
+                      ]}
+            )
+    except httpx.ConnectError:
+        raise HTTPException(503, f"Ollama に接続できません ({ollama_url})")
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Ollama がタイムアウトしました")
+
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Ollama error: {resp.text[:200]}")
+
+    body = resp.json()
+    comment = body.get("message", {}).get("content") or body.get("response", "")
+    if not comment:
+        raise HTTPException(502, "Ollama レスポンス不正")
+
+    thread_no = _next_thread_no(db, data.project_id)
+    t = db.execute(text("""
+        INSERT INTO review_threads (project_id, thread_no, title, status)
+        VALUES (:p, :tn, :ti, 'open') RETURNING id
+    """), {"p": data.project_id, "tn": thread_no, "ti": data.title}).fetchone()
+    thread_id = t[0]
+    db.execute(text("""
+        INSERT INTO review_entries (thread_id, seq, entry_type, role, comment)
+        VALUES (:t, 1, 'issue', 'ai', :c)
+    """), {"t": thread_id, "c": comment})
+    _audit(db, data.project_id, "ai", "auto_thread", thread_id, {})
+    db.commit()
+    return {"status": "ok", "id": thread_id, "thread_no": thread_no, "comment": comment}
+#+end_src
+
+** io_router.py
+
+#+begin_src python :tangle backend/io_router.py
+"""
+JSONエクスポート/インポート
+"""
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from database import get_db
+from auth import get_current_user, UserContext
+from datetime import datetime
+import json
+
+router = APIRouter(tags=["io"])
+
+
+def _export_system(db, system_id: int) -> dict:
+    sys_row = db.execute(
+        text("SELECT id, name, department FROM systems WHERE id=:id"),
+        {"id": system_id}
+    ).fetchone()
+    if not sys_row:
+        raise HTTPException(404, "システムが見つかりません")
+
+    projects = db.execute(text("""
+        SELECT id, name, cost_category, is_system_wide,
+               amount_single, amount_advance, amount_deferred, evaluator_name,
+               estimate_text, requirements_text, basis_text
+        FROM projects WHERE system_id=:s ORDER BY is_system_wide DESC, id
+    """), {"s": system_id}).fetchall()
+
+    result_projects = []
+    for p in projects:
+        threads = db.execute(text("""
+            SELECT id, thread_no, title, status, due_date::text
+            FROM review_threads WHERE project_id=:p ORDER BY thread_no
+        """), {"p": p.id}).fetchall()
+
+        result_threads = []
+        for t in threads:
+            entries = db.execute(text("""
+                SELECT seq, entry_type, role, comment, entry_date::text
+                FROM review_entries WHERE thread_id=:t ORDER BY seq
+            """), {"t": t.id}).fetchall()
+            result_threads.append({
+                "thread_no": t.thread_no,
+                "title": t.title,
+                "status": t.status,
+                "due_date": t.due_date,
+                "entries": [dict(e._mapping) for e in entries]
+            })
+
+        result_projects.append({
+            "name": p.name,
+            "is_system_wide": p.is_system_wide,
+            "cost_category": p.cost_category,
+            "amount_single": p.amount_single,
+            "amount_advance": p.amount_advance,
+            "amount_deferred": p.amount_deferred,
+            "evaluator_name": p.evaluator_name,
+            "estimate_text": p.estimate_text,
+            "requirements_text": p.requirements_text,
+            "basis_text": p.basis_text,
+            "threads": result_threads,
+        })
+
+    return {
+        "export_version": "1.0",
+        "exported_at": datetime.now().isoformat(),
+        "system": {"id": sys_row.id, "name": sys_row.name, "department": sys_row.department},
+        "projects": result_projects,
+    }
+
+
+@router.get("/export/system/{system_id}/json")
+def export_system_json(system_id: int, db: Session = Depends(get_db),
+                       user: UserContext = Depends(get_current_user)):
+    user.require("export")
+    data = _export_system(db, system_id)
+    return data
+
+
+@router.post("/import/system")
+def import_system_json(payload: dict, db: Session = Depends(get_db),
+                       user: UserContext = Depends(get_current_user)):
+    user.require("manage")
+    if payload.get("export_version") != "1.0":
+        raise HTTPException(400, "サポートされていない export_version です")
+
+    sys_data = payload.get("system", {})
+    sys_row = db.execute(
+        text("INSERT INTO systems (name, department) VALUES (:n,:d) RETURNING id"),
+        {"n": sys_data.get("name","インポートシステム"), "d": sys_data.get("department")}
+    ).fetchone()
+    system_id = sys_row[0]
+
+    for p in payload.get("projects", []):
+        if p.get("is_system_wide"):
+            pj_row = db.execute(
+                text("INSERT INTO projects (system_id, name, is_system_wide) VALUES (:s,:n,TRUE) RETURNING id"),
+                {"s": system_id, "n": p.get("name", "システム全体")}
+            ).fetchone()
+        else:
+            pj_row = db.execute(text("""
+                INSERT INTO projects
+                  (system_id, name, cost_category, amount_single, amount_advance, amount_deferred,
+                   evaluator_name, estimate_text, requirements_text, basis_text)
+                VALUES (:s,:n,:cc,:as,:aa,:ad,:en,:et,:rt,:bt) RETURNING id
+            """), {"s": system_id, "n": p.get("name"), "cc": p.get("cost_category"),
+                   "as": p.get("amount_single",0), "aa": p.get("amount_advance",0),
+                   "ad": p.get("amount_deferred",0), "en": p.get("evaluator_name"),
+                   "et": p.get("estimate_text"), "rt": p.get("requirements_text"),
+                   "bt": p.get("basis_text")}).fetchone()
+        project_id = pj_row[0]
+
+        for t in p.get("threads", []):
+            t_row = db.execute(text("""
+                INSERT INTO review_threads (project_id, thread_no, title, status, due_date)
+                VALUES (:p,:tn,:ti,:st,:dd) RETURNING id
+            """), {"p": project_id, "tn": t.get("thread_no"), "ti": t.get("title"),
+                   "st": t.get("status","open"), "dd": t.get("due_date")}).fetchone()
+            thread_id = t_row[0]
+
+            for e in t.get("entries", []):
+                db.execute(text("""
+                    INSERT INTO review_entries (thread_id, seq, entry_type, role, comment, entry_date)
+                    VALUES (:t,:s,:et,:r,:c,:ed)
+                """), {"t": thread_id, "s": e.get("seq"), "et": e.get("entry_type"),
+                       "r": e.get("role"), "c": e.get("comment",""),
+                       "ed": e.get("entry_date")})
+
+    db.commit()
+    return {"status": "ok", "system_id": system_id}
+#+end_src
+
+** types.ts
+
+#+begin_src typescript :tangle frontend/src/types.ts
+// ── 共通型定義 ──────────────────────────────────────
+export type UserRole = "admin" | "evaluator" | "pjmo" | "viewer";
+export type View = "dashboard" | "systems" | "rally" | "advisor" | "audit" | "webhook";
+
+export type ThreadStatus = "open" | "replied" | "reviewing" | "closed";
+export type EntryType   = "issue" | "reply" | "review" | "close";
+export type EntryRole   = "evaluator" | "pjmo" | "ai";
+
+export interface SystemRow {
+  id: number;
+  name: string;
+  department: string;
+  created_at: string;
+  project_count: number;
+  thread_count: number;
+  open_count: number;
+}
+
+export interface ProjectRow {
+  id: number;
+  system_id: number;
+  name: string;
+  cost_category: string | null;
+  is_system_wide: boolean;
+  amount_single: number;
+  amount_advance: number;
+  amount_deferred: number;
+  evaluator_name: string | null;
+  estimate_text: string | null;
+  requirements_text: string | null;
+  basis_text: string | null;
+  created_at: string;
+  thread_count: number;
+  open_count: number;
+}
+
+export interface ThreadRow {
+  id: number;
+  thread_no: number;
+  title: string | null;
+  status: ThreadStatus;
+  due_date: string | null;
+  created_at: string;
+  entry_count: number;
+  last_activity: string | null;
+}
+
+export interface EntryRow {
+  id: number;
+  seq: number;
+  entry_type: EntryType;
+  role: EntryRole;
+  comment: string;
+  entry_date: string | null;
+  created_at: string;
+}
+
+export interface AuditRow {
+  user_name: string;
+  action: string;
+  target_table: string;
+  target_id: number;
+  created_at: string;
+}
+
+export interface WebhookRow {
+  id: number;
+  event_type: string;
+  status: string;
+  created_at: string;
+  sent_at: string | null;
+}
+
+// ── ステータス設定 ──────────────────────────────────
+export const THREAD_STATUS: Record<ThreadStatus, { label: string; color: string; bg: string; border: string }> = {
+  open:      { label: "未回答",  color: "#9B1C1C", bg: "#FEF2F2", border: "#FECACA" },
+  replied:   { label: "回答済", color: "#854F0B", bg: "#FFFBEB", border: "#FDE68A" },
+  reviewing: { label: "再評価中", color: "#1E3A8A", bg: "#EFF6FF", border: "#BFDBFE" },
+  closed:    { label: "確定",   color: "#166534", bg: "#F0FDF4", border: "#BBF7D0" },
+};
+
+export const ENTRY_TYPE: Record<EntryType, { label: string; color: string; bg: string }> = {
+  issue:  { label: "指摘",   color: "#9B1C1C", bg: "#FEF2F2" },
+  reply:  { label: "回答",   color: "#166534", bg: "#F0FDF4" },
+  review: { label: "再評価", color: "#854F0B", bg: "#FFFBEB" },
+  close:  { label: "確定",   color: "#475569", bg: "#F8FAFC" },
+};
+
+export const ROLE_ICON: Record<EntryRole, { icon: string; color: string; label: string }> = {
+  evaluator: { icon: "◈", color: "#1E3A8A", label: "評価者" },
+  pjmo:      { icon: "◇", color: "#166534", label: "PJMO"  },
+  ai:        { icon: "◆", color: "#6B21A8", label: "AI"    },
+};
+
+export const COST_CATEGORIES = [
+  "整備費（投資的整備）",
+  "整備費（維持的整備）",
+  "整備費（サービス利用料）",
+  "運用費",
+  "保守費",
+] as const;
 #+end_src
 
 * フロントエンド
@@ -1238,18 +2393,23 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: 3005,
+    cors: true,
     proxy: {
       '/api': {
-        target: process.env.REACT_APP_API_URL || 'http://backend:8000',
+        target: 'http://backend:8000',
         changeOrigin: true,
+        secure: false,
         rewrite: (path) => path.replace(/^\/api/, ''),
+        configure: (proxy) => {
+          proxy.on('error', (err) => {
+            console.error('[proxy error]', err.message);
+          });
+          proxy.on('proxyReq', (proxyReq, req) => {
+            console.log('[proxy]', req.method, req.url, '→', proxyReq.path);
+          });
+        },
       },
     },
-  },
-  define: {
-    'process.env.REACT_APP_API_URL': JSON.stringify(
-      process.env.REACT_APP_API_URL || 'http://localhost:8000'
-    ),
   },
 })
 #+end_src
@@ -1341,6 +2501,386 @@ RUN printf 'server {\n  listen 80;\n  root /usr/share/nginx/html;\n  index index
 EXPOSE 80
 #+end_src
 
+
+** src/BudgetAdvisor.tsx（予算額妥当性評価アドバイザー）
+
+DS-110/DS-910準拠の予算評価対話UIコンポーネント。
+Ollamaバックエンド経由でチャット形式の評価を実施し、評価状況パネルで進捗を管理する。
+
+#+begin_src typescript :tangle frontend/src/BudgetAdvisor.tsx
+import React, { useState, useRef, useEffect, useCallback } from "react";
+
+// ─────────────────────────────────────────────
+// システムプロンプト（budget_advisor-.jsx から移植）
+// ─────────────────────────────────────────────
+const SYSTEM_PROMPT = `あなたは政府情報システムの予算額妥当性評価アドバイザーです。
+DS-110（デジタル社会推進標準ガイドライン第3編第3章「予算及び執行」）およびDS-910（安全保障等の機微な情報に係る政府情報システムの取扱い）に基づき、PJMOに対して対話形式で予算要求の妥当性を検証します。
+
+【評価観点（DS-110）】
+Ⅰ.予算マネジメント基礎: コスト分解の徹底、当初想定と実際の乖離チェック、ドキュメント整備状況、調達方法・契約方式の事前検討、最新アーキテクチャ動向の把握、予算編成・執行日程の把握
+Ⅱ.費用対効果・投資妥当性: 機能・業務範囲の把握、整備経費・運用等経費の管理、中長期的投資計画の整備、予算・会計制度の熟知、国庫債務負担行為の適正活用
+Ⅲ.資料準備・要求根拠の合理性: サービス・業務提供レベルの必要十分性、想定効果の事実情報への基づき、業務課題の実態に基づく抽出、機能の目的に照らした必要十分性、情報システムの担う役割・期待効果の明確化、要求額の精査・積算、機能・性能要求の実データへの基づき
+Ⅳ.経費見積りの適正性: 事業者への必要情報提供、積算内訳の明確化（数量・工数・作業者レベル・単価）、ライフサイクルコストの見積りと根拠、情報システム単位での積算、経費区分（別紙２）への準拠、複数事業者見積りの比較、クラウドサービス利用前提の見積り、補正予算時の精査
+Ⅴ.ガバナンス・承認プロセス: PMOへの資料提出・説明対応、デジタル庁からの指摘への対応、プロジェクト計画書への反映
+Ⅵ.一括計上対象システムの予算執行管理: 執行計画案の適時作成、入札差額等執行残の適正管理、執行実績の記録と定期報告、執行計画変更時の協議・承認、日常的な適切な予算執行
+
+【評価観点（DS-910）】
+Ⅰ.基本方針・説明責任: 機微情報システムの社会的影響の認識、機器構成・設置場所・運用体制の自ら把握、高度な自律性の確保
+Ⅱ.リスク対応策（データ・運用・ソフトウェア・ハードウェア・データセンタ/通信）
+Ⅲ.クラウド化の検討: Cloud by Default原則の遵守、NIST定義基準の充足
+Ⅳ.データ連携における留意点: 自律性確保度合いの差異識別、脆弱性リスクへの対策
+Ⅴ.機微情報の定義・範囲管理
+
+【提出資料】
+プロジェクト計画書、概算要求書、一件一葉、積算過程がわかる資料、見積資料、見積辞退書、要件を記載した資料、実績資料
+
+【行動指針】
+1. まず事業の概要（事業名・事業類型・要求額・DS-910対象か否か）を確認する
+2. 事業類型（新規整備/運用保守/システム更改/クラウド移行）に応じて評価観点を優先づけする
+3. 一度に1〜2個の質問を投げかけ、回答を踏まえて深掘りまたは次の観点へ進む
+4. 問題点を発見した場合は根拠条項（DS-110第3章○.、DS-910第○章）を明示して指摘する
+5. 各観点の評価が完了したら「○」「△」「×」「未確認」で記録し、セッション終了時に評価サマリーを出力する
+6. 「一式」表記の見積りは根拠なしとして必ず指摘する
+7. Cloud by Default原則との整合性は全案件で必ず確認する
+8. 複数事業者見積りの有無は必ず確認する（「1者」見積りは原則違反）
+9. 評価サマリーを求められたら、評価観点ごとの結果を表形式でまとめる
+10. 回答は簡潔・実務的な日本語で行う。条文引用は必要最小限に留める。`;
+
+const INITIAL_MESSAGE = {
+  role: "assistant" as const,
+  content: `予算額妥当性評価アドバイザーへようこそ。
+
+DS-110・DS-910に基づき、対話形式で予算要求の妥当性を検証します。提出資料（プロジェクト計画書・概算要求書・積算資料・見積資料等）をご参照いただきながら回答ください。
+
+**まず基本情報を確認します。**
+
+① 事業名（またはシステム名）と今回の要求額をお知らせください。
+② 事業類型はどれに該当しますか？
+　・新規整備　・運用保守　・システム更改　・クラウド移行　・その他
+
+また、DS-910（安全保障等の機微な情報）の対象システムですか？`,
+};
+
+const evalItems = [
+  { id: "cost_breakdown",     label: "コスト分解",             category: "DS-110" },
+  { id: "deviation_check",    label: "当初想定との乖離確認",    category: "DS-110" },
+  { id: "documentation",      label: "ドキュメント整備",        category: "DS-110" },
+  { id: "procurement_method", label: "調達方法・契約方式",      category: "DS-110" },
+  { id: "rationality",        label: "要求根拠の合理性",        category: "DS-110" },
+  { id: "estimate_detail",    label: "積算内訳の明確化",        category: "DS-110" },
+  { id: "lifecycle_cost",     label: "ライフサイクルコスト",    category: "DS-110" },
+  { id: "multi_vendor",       label: "複数事業者見積り",        category: "DS-110" },
+  { id: "cloud_default",      label: "Cloud by Default",       category: "DS-110" },
+  { id: "governance",         label: "ガバナンス・承認",        category: "DS-110" },
+  { id: "autonomy",           label: "自律性の確保",            category: "DS-910" },
+  { id: "data_security",      label: "データセキュリティ要件",  category: "DS-910" },
+  { id: "sw_supply_chain",    label: "ソフトウェアサプライチェーン", category: "DS-910" },
+  { id: "dc_location",        label: "データセンタ・設置場所",  category: "DS-910" },
+];
+
+const STATUS_CFG: Record<string, { label: string; bg: string; color: string; border: string }> = {
+  "○": { label: "○ 問題なし", bg: "#EAF3DE", color: "#3B6D11", border: "#97C459" },
+  "△": { label: "△ 要確認",  bg: "#FAEEDA", color: "#854F0B", border: "#EF9F27" },
+  "×": { label: "× 不備あり", bg: "#FCEBEB", color: "#A32D2D", border: "#F09595" },
+  "未": { label: "未確認",    bg: "#F1EFE8", color: "#5F5E5A", border: "#B4B2A9" },
+};
+
+type MsgRole = "user" | "assistant";
+interface Msg { role: MsgRole; content: string; }
+
+// ─────────────────────────────────────────────
+// Props
+// ─────────────────────────────────────────────
+interface Props {
+  api: string;
+  headers: () => Record<string, string>;
+}
+
+export default function BudgetAdvisor({ api, headers }: Props) {
+  const [messages, setMessages] = useState<Msg[]>([INITIAL_MESSAGE]);
+  const [input, setInput]       = useState("");
+  const [loading, setLoading]   = useState(false);
+  const [evalStatus, setEvalStatus] = useState<Record<string, string>>(
+    Object.fromEntries(evalItems.map(i => [i.id, "未"]))
+  );
+  const [showPanel, setShowPanel]   = useState(true);
+  const [uploadedFiles, setUploadedFiles] = useState<string[]>([]);
+  const chatEndRef  = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, loading]);
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    setUploadedFiles(prev => [...prev, ...files.map(f => f.name)]);
+    const names = files.map(f => f.name).join("、");
+    setMessages(prev => [...prev, {
+      role: "assistant",
+      content: `資料「${names}」を受領しました。内容を踏まえて評価を進めます。`,
+    }]);
+  };
+
+  // Ollamaバックエンド経由で送信
+  const sendMessage = async () => {
+    const text = input.trim();
+    if (!text || loading) return;
+    setInput("");
+    const newMessages: Msg[] = [...messages, { role: "user", content: text }];
+    setMessages(newMessages);
+    setLoading(true);
+    try {
+      const r = await fetch(`${api}/advisor/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...headers() },
+        body: JSON.stringify({
+          messages: newMessages.map(m => ({ role: m.role, content: m.content })),
+          system: SYSTEM_PROMPT,
+        }),
+      });
+      const raw = await r.text();
+      if (!r.ok) {
+        let msg = `HTTP ${r.status}`;
+        try { msg = JSON.parse(raw)?.detail ?? msg; } catch {}
+        throw new Error(msg);
+      }
+      const data = JSON.parse(raw);
+      const reply: string = data.content ?? "（応答なし）";
+      setMessages(prev => [...prev, { role: "assistant", content: reply }]);
+      autoUpdateEval(reply);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setMessages(prev => [...prev, { role: "assistant", content: `エラー: ${msg}` }]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const autoUpdateEval = (reply: string) => {
+    const updates: Record<string, string> = {};
+    const neg = (s: string) => s.includes("×") || s.includes("不備") || s.includes("問題");
+    const que = (s: string) => s.includes("△") || s.includes("確認");
+    if (/コスト.*分解|作業工程.*単位|一式.*見積/i.test(reply))   updates.cost_breakdown     = neg(reply) ? "×" : que(reply) ? "△" : "○";
+    if (/乖離|当初.*想定|運用.*状況/i.test(reply))                updates.deviation_check    = neg(reply) ? "×" : "△";
+    if (/ドキュメント|設計書|台帳/i.test(reply))                   updates.documentation      = neg(reply) ? "×" : "△";
+    if (/調達方法|契約方式|単年度|複数年度|国庫債務/i.test(reply)) updates.procurement_method = "△";
+    if (/費用対効果|合理性|根拠|実績データ|事実情報/i.test(reply)) updates.rationality        = neg(reply) ? "×" : "△";
+    if (/積算内訳|工数|単価|作業者.*レベル/i.test(reply))          updates.estimate_detail    = neg(reply) || /一式/i.test(reply) ? "×" : "△";
+    if (/ライフサイクル|LCC/i.test(reply))                         updates.lifecycle_cost     = "△";
+    if (/複数.*事業者|2者|3者|1者.*見積/i.test(reply))             updates.multi_vendor       = /1者/i.test(reply) || neg(reply) ? "×" : "○";
+    if (/Cloud|クラウド/i.test(reply))                             updates.cloud_default      = neg(reply) || /未検討/i.test(reply) ? "×" : /○|問題なし/i.test(reply) ? "○" : "△";
+    if (/PMO|デジタル庁.*確認|プロジェクト計画書/i.test(reply))   updates.governance         = "△";
+    if (/自律性|自ら.*把握|高度な自律/i.test(reply))               updates.autonomy           = neg(reply) ? "×" : "△";
+    if (/暗号化|削除|冗長性|操作権限/i.test(reply))                updates.data_security      = "△";
+    if (/SBOM|サプライチェーン|脆弱性.*対応/i.test(reply))         updates.sw_supply_chain    = "△";
+    if (/データセンタ|設置場所|国内.*立地/i.test(reply))           updates.dc_location        = "△";
+    if (Object.keys(updates).length > 0)
+      setEvalStatus(prev => ({ ...prev, ...updates }));
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  };
+
+  const setStatus = (id: string, status: string) =>
+    setEvalStatus(prev => ({ ...prev, [id]: status }));
+
+  const ds110Items = evalItems.filter(i => i.category === "DS-110");
+  const ds910Items = evalItems.filter(i => i.category === "DS-910");
+  const countByStatus = (s: string) => Object.values(evalStatus).filter(v => v === s).length;
+
+  const resetSession = () => {
+    setMessages([INITIAL_MESSAGE]);
+    setEvalStatus(Object.fromEntries(evalItems.map(i => [i.id, "未"])));
+    setUploadedFiles([]);
+  };
+
+  return (
+    <div style={{ display: "flex", height: "calc(100vh - 54px)", gap: 0,
+                  fontFamily: "'Noto Sans JP',sans-serif", background: "#f8fafc" }}>
+
+      {/* ── 左ペイン：チャット ── */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0,
+                    borderRight: "1px solid #e2e8f0" }}>
+
+        {/* ヘッダー */}
+        <div style={{ padding: "10px 16px", borderBottom: "1px solid #e2e8f0",
+                      background: "#fff", display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ width: 32, height: 32, borderRadius: 8, background: "#eef2ff",
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        fontSize: 14, color: "#4338ca", fontWeight: 700 }}>AI</div>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#0f172a" }}>予算額妥当性評価アドバイザー</div>
+            <div style={{ fontSize: 11, color: "#94a3b8" }}>DS-110 / DS-910 準拠 · Ollama ({"{OLLAMA_MODEL}"})</div>
+          </div>
+          <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
+            {uploadedFiles.length > 0 && (
+              <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 4,
+                             background: "#eff6ff", color: "#1d4ed8", border: "1px solid #bfdbfe" }}>
+                {uploadedFiles.length}件の資料
+              </span>
+            )}
+            <button onClick={() => fileInputRef.current?.click()} style={chipBtn}>資料アップロード</button>
+            <button onClick={() => setShowPanel(p => !p)} style={chipBtn}>
+              {showPanel ? "評価欄を隠す" : "評価欄を表示"}
+            </button>
+            <button onClick={resetSession} style={{ ...chipBtn, color: "#dc2626", borderColor: "#fca5a5" }}>
+              リセット
+            </button>
+          </div>
+          <input ref={fileInputRef} type="file" multiple style={{ display: "none" }}
+            accept=".pdf,.docx,.xlsx,.pptx,.txt" onChange={handleFileUpload} />
+        </div>
+
+        {/* メッセージ */}
+        <div style={{ flex: 1, overflowY: "auto", padding: "16px 16px 8px", background: "#f8fafc" }}>
+          {messages.map((m, i) => (
+            <div key={i} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start",
+                                  marginBottom: 12, gap: 8, alignItems: "flex-start" }}>
+              {m.role === "assistant" && (
+                <div style={{ width: 28, height: 28, borderRadius: "50%", flexShrink: 0, marginTop: 2,
+                              background: "#eef2ff", display: "flex", alignItems: "center", justifyContent: "center",
+                              fontSize: 11, fontWeight: 700, color: "#4338ca", border: "1px solid #c7d2fe" }}>AI</div>
+              )}
+              <div style={{
+                maxWidth: "80%", padding: "10px 14px",
+                borderRadius: m.role === "user" ? "12px 12px 4px 12px" : "12px 12px 12px 4px",
+                background: m.role === "user" ? "#eef2ff" : "#fff",
+                border: m.role === "user" ? "1px solid #c7d2fe" : "1px solid #e2e8f0",
+                fontSize: 13.5, lineHeight: 1.7, color: "#1e293b",
+                whiteSpace: "pre-wrap", wordBreak: "break-word",
+              }}>{m.content}</div>
+              {m.role === "user" && (
+                <div style={{ width: 28, height: 28, borderRadius: "50%", flexShrink: 0, marginTop: 2,
+                              background: "#f1f5f9", display: "flex", alignItems: "center", justifyContent: "center",
+                              fontSize: 11, fontWeight: 700, color: "#475569", border: "1px solid #e2e8f0" }}>担当</div>
+              )}
+            </div>
+          ))}
+          {loading && (
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-start", marginBottom: 12 }}>
+              <div style={{ width: 28, height: 28, borderRadius: "50%", flexShrink: 0,
+                            background: "#eef2ff", display: "flex", alignItems: "center", justifyContent: "center",
+                            fontSize: 11, fontWeight: 700, color: "#4338ca", border: "1px solid #c7d2fe" }}>AI</div>
+              <div style={{ padding: "10px 14px", borderRadius: "12px 12px 12px 4px",
+                            border: "1px solid #e2e8f0", background: "#fff", fontSize: 13, color: "#94a3b8" }}>
+                評価中…
+              </div>
+            </div>
+          )}
+          <div ref={chatEndRef} />
+        </div>
+
+        {/* クイックアクション */}
+        <div style={{ padding: "6px 16px 0", display: "flex", gap: 6, flexWrap: "wrap", background: "#fff",
+                      borderTop: "1px solid #f1f5f9" }}>
+          {[
+            "評価サマリーを出力してください",
+            "積算内訳を確認します",
+            "Cloud by Default原則の確認をします",
+            "複数事業者見積りの状況を確認します",
+          ].map(q => (
+            <button key={q} onClick={() => setInput(q)} style={chipBtn}>{q}</button>
+          ))}
+        </div>
+
+        {/* 入力エリア */}
+        <div style={{ padding: "10px 16px 12px", display: "flex", gap: 8,
+                      alignItems: "flex-end", background: "#fff" }}>
+          <textarea
+            value={input} onChange={e => setInput(e.target.value)} onKeyDown={handleKeyDown}
+            placeholder="PJMOの回答を入力…（Enterで送信、Shift+Enterで改行）"
+            style={{ flex: 1, minHeight: 56, maxHeight: 120, resize: "vertical",
+                     padding: "8px 12px", fontSize: 13, lineHeight: 1.5, borderRadius: 8,
+                     border: "1px solid #e2e8f0", fontFamily: "'Noto Sans JP',sans-serif",
+                     background: "#f8fafc", color: "#1e293b" }}
+          />
+          <button onClick={sendMessage} disabled={loading || !input.trim()} style={{
+            padding: "8px 18px", borderRadius: 8, cursor: loading || !input.trim() ? "not-allowed" : "pointer",
+            background: loading || !input.trim() ? "#cbd5e1" : "#4338ca",
+            color: loading || !input.trim() ? "#94a3b8" : "#fff",
+            border: "none", fontSize: 13, fontWeight: 700,
+            height: 56, flexShrink: 0, fontFamily: "'Noto Sans JP',sans-serif",
+          }}>送信</button>
+        </div>
+      </div>
+
+      {/* ── 右ペイン：評価状況 ── */}
+      {showPanel && (
+        <div style={{ width: 270, flexShrink: 0, overflowY: "auto",
+                      padding: "14px 14px", background: "#fff", borderLeft: "1px solid #e2e8f0" }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#475569", marginBottom: 10 }}>評価状況パネル</div>
+
+          {/* サマリーカウント */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 14 }}>
+            {(["○", "△", "×", "未"] as const).map(s => (
+              <div key={s} style={{ padding: "6px 8px", borderRadius: 6, textAlign: "center",
+                                    background: STATUS_CFG[s].bg, border: `1px solid ${STATUS_CFG[s].border}` }}>
+                <div style={{ fontSize: 18, fontWeight: 700, color: STATUS_CFG[s].color }}>{countByStatus(s)}</div>
+                <div style={{ fontSize: 10, color: STATUS_CFG[s].color }}>{STATUS_CFG[s].label}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* DS-110 */}
+          <EvalSection title="DS-110" color="#4338ca" bg="#eef2ff" border="#c7d2fe"
+            items={ds110Items} evalStatus={evalStatus} setStatus={setStatus} />
+
+          {/* DS-910 */}
+          <EvalSection title="DS-910" color="#166534" bg="#f0fdf4" border="#bbf7d0"
+            items={ds910Items} evalStatus={evalStatus} setStatus={setStatus} />
+
+          <div style={{ marginTop: 12, padding: "8px 10px", borderRadius: 6,
+                        background: "#f8fafc", fontSize: 11, color: "#64748b", lineHeight: 1.6 }}>
+            各観点をAIの対話内容から自動判定、または手動で記録できます。
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EvalSection({ title, color, bg, border, items, evalStatus, setStatus }: {
+  title: string; color: string; bg: string; border: string;
+  items: typeof evalItems; evalStatus: Record<string, string>;
+  setStatus: (id: string, s: string) => void;
+}) {
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color, marginBottom: 6,
+                    padding: "3px 8px", background: bg, borderRadius: 4,
+                    border: `1px solid ${border}`, display: "inline-block" }}>{title}</div>
+      {items.map(item => (
+        <div key={item.id} style={{ display: "flex", alignItems: "center",
+                                    justifyContent: "space-between", padding: "5px 0",
+                                    borderBottom: "1px solid #f1f5f9" }}>
+          <span style={{ fontSize: 11.5, color: "#334155", flex: 1, paddingRight: 6 }}>{item.label}</span>
+          <div style={{ display: "flex", gap: 3 }}>
+            {["○", "△", "×", "未"].map(s => (
+              <button key={s} onClick={() => setStatus(item.id, s)} style={{
+                width: 22, height: 22, borderRadius: 3, cursor: "pointer", fontSize: 10,
+                border: evalStatus[item.id] === s
+                  ? `1.5px solid ${STATUS_CFG[s].border}` : "1px solid #e2e8f0",
+                background: evalStatus[item.id] === s ? STATUS_CFG[s].bg : "transparent",
+                color: evalStatus[item.id] === s ? STATUS_CFG[s].color : "#94a3b8",
+                fontWeight: evalStatus[item.id] === s ? 700 : 400,
+              }}>{s === "未" ? "?" : s}</button>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const chipBtn: React.CSSProperties = {
+  fontSize: 11, padding: "4px 10px", cursor: "pointer", borderRadius: 20,
+  border: "1px solid #e2e8f0", background: "transparent", color: "#64748b",
+  whiteSpace: "nowrap", fontFamily: "'Noto Sans JP',sans-serif",
+};
+#+end_src
+
 ** src/index.tsx
 
 #+begin_src typescript :tangle frontend/src/index.tsx
@@ -1356,367 +2896,689 @@ root.render(<App />);
 
 #+begin_src typescript :tangle frontend/src/App.tsx
 import React, { useEffect, useState, useCallback } from "react";
+import { View, UserRole, SystemRow, ProjectRow, ThreadRow, EntryRow,
+         AuditRow, WebhookRow, THREAD_STATUS, ENTRY_TYPE, ROLE_ICON,
+         COST_CATEGORIES } from "./types";
+import BudgetAdvisor from "./BudgetAdvisor";
 
-type Status = "issue" | "reply" | "review" | "close";
-type UserRole = "admin" | "evaluator" | "pjmo" | "viewer";
-type View = "dashboard" | "rally" | "ai" | "audit" | "webhook";
+const API = "/api";
 
-interface ReviewLog {
-  id: number; author: string; role: string; comment: string;
-  status: Status; version: number;
-  confirmed_by: string | null; confirmed_at: string | null; created_at: string;
-}
-interface Project { id: number; name: string; description: string; }
-interface AuditEntry { user_name: string; action: string; target_table: string; target_id: number; created_at: string; }
-interface WebhookLog { id: number; event_type: string; status: string; created_at: string; sent_at: string | null; }
-
-// process.env は Vite の define で展開される
-const API = (typeof process !== "undefined" && process.env?.REACT_APP_API_URL) || "http://localhost:8000";
-
-const SC: Record<Status, { label: string; color: string; bg: string; border: string; hex: string }> = {
-  issue:  { label: "指摘",   color: "#b91c1c", bg: "#fef2f2", border: "#fca5a5", hex: "#ef4444" },
-  reply:  { label: "回答",   color: "#15803d", bg: "#f0fdf4", border: "#86efac", hex: "#22c55e" },
-  review: { label: "再評価", color: "#92400e", bg: "#fffbeb", border: "#fcd34d", hex: "#f59e0b" },
-  close:  { label: "確定",   color: "#475569", bg: "#f8fafc", border: "#cbd5e1", hex: "#94a3b8" },
+// ── スタイル定数 ─────────────────────────────────────
+const S = {
+  input: { padding: "7px 10px", border: "1px solid #e2e8f0", borderRadius: 6,
+           fontSize: 13, fontFamily: "'Noto Sans JP',sans-serif", background: "#fafafa" } as React.CSSProperties,
+  card:  { background: "#fff", borderRadius: 10, padding: 20, boxShadow: "0 1px 3px rgba(0,0,0,.07)" } as React.CSSProperties,
+  empty: { textAlign: "center" as const, color: "#94a3b8", padding: "32px 0", fontSize: 14 },
+  h2:    { fontSize: 15, fontWeight: 700, color: "#0f172a", margin: "0 0 16px" } as React.CSSProperties,
 };
-const RC: Record<string, { icon: string; accent: string }> = {
-  "評価者": { icon: "◈", accent: "#1e3a8a" },
-  "PJMO":   { icon: "◇", accent: "#166534" },
-  "AI":     { icon: "◆", accent: "#6b21a8" },
-};
+const btn = (color = "#0f172a", disabled = false): React.CSSProperties => ({
+  background: disabled ? "#cbd5e1" : color, color: "#fff", border: "none",
+  borderRadius: 6, padding: "8px 18px", fontSize: 13, fontWeight: 700,
+  cursor: disabled ? "not-allowed" : "pointer", fontFamily: "'Noto Sans JP',sans-serif",
+});
+const chipBtn = (color = "#64748b"): React.CSSProperties => ({
+  fontSize: 11, padding: "4px 10px", cursor: "pointer", borderRadius: 20,
+  border: `1px solid #e2e8f0`, background: "transparent", color,
+  fontFamily: "'Noto Sans JP',sans-serif", whiteSpace: "nowrap" as const,
+});
+
+// ── ナビ定義 ─────────────────────────────────────────
 const NAV: { key: View; icon: string; label: string }[] = [
   { key: "dashboard", icon: "▦", label: "ダッシュボード" },
-  { key: "rally",     icon: "⇄", label: "レビューラリー" },
-  { key: "ai",        icon: "◈", label: "AI自動レビュー" },
+  { key: "systems",   icon: "⊞", label: "システム管理" },
+  { key: "rally",     icon: "⇄", label: "評価ラリー" },
+  { key: "advisor",   icon: "◉", label: "予算評価AI" },
   { key: "audit",     icon: "≡", label: "監査ログ" },
   { key: "webhook",   icon: "⬡", label: "通知履歴" },
 ];
 
-const S: Record<string, React.CSSProperties> = {
-  input: { padding: "7px 10px", border: "1px solid #e2e8f0", borderRadius: 6,
-           fontSize: 13, fontFamily: "'Noto Sans JP',sans-serif", background: "#fafafa" },
-};
+// ── Toastコンポーネント ───────────────────────────────
+function Toast({ msg }: { msg: string }) {
+  return (
+    <div style={{ position: "fixed", top: 20, right: 20, zIndex: 9999,
+                  background: "#0f172a", color: "#fff", padding: "10px 20px",
+                  borderRadius: 8, fontSize: 13, boxShadow: "0 4px 12px rgba(0,0,0,.3)" }}>
+      {msg}
+    </div>
+  );
+}
 
-function Badge({ s }: { s: Status }) {
-  const c = SC[s];
+// ── バッジ ─────────────────────────────────────────────
+function StatusBadge({ status }: { status: keyof typeof THREAD_STATUS }) {
+  const c = THREAD_STATUS[status];
   return (
     <span style={{ fontSize: 10, fontWeight: 700, color: c.color, background: c.bg,
                    border: `1px solid ${c.border}`, borderRadius: 4,
-                   padding: "1px 7px", fontFamily: "monospace", letterSpacing: 0.5 }}>{c.label}</span>
+                   padding: "1px 7px", fontFamily: "monospace" }}>{c.label}</span>
+  );
+}
+function TypeBadge({ type }: { type: keyof typeof ENTRY_TYPE }) {
+  const c = ENTRY_TYPE[type];
+  return (
+    <span style={{ fontSize: 10, fontWeight: 700, color: c.color, background: c.bg,
+                   borderRadius: 4, padding: "1px 7px", fontFamily: "monospace" }}>{c.label}</span>
   );
 }
 
-function KpiCard({ label, value, color, sub }: { label: string; value: number | string; color: string; sub?: string }) {
+// ── KPIカード ──────────────────────────────────────────
+function KpiCard({ label, value, color, sub }: { label: string; value: string | number; color: string; sub?: string }) {
   return (
-    <div style={{ background: "#fff", borderRadius: 10, padding: "18px 20px",
-                  boxShadow: "0 1px 3px rgba(0,0,0,0.07)",
-                  borderTop: `3px solid ${color}`, flex: 1, minWidth: 130 }}>
-      <div style={{ fontSize: 11, color: "#94a3b8", fontWeight: 700, letterSpacing: 0.5, marginBottom: 6 }}>{label}</div>
-      <div style={{ fontSize: 28, fontWeight: 800, color, fontFamily: "monospace", lineHeight: 1 }}>{value}</div>
-      {sub && <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 4 }}>{sub}</div>}
+    <div style={{ background: "#fff", borderRadius: 10, padding: "16px 18px",
+                  boxShadow: "0 1px 3px rgba(0,0,0,.07)", borderTop: `3px solid ${color}`,
+                  flex: 1, minWidth: 120 }}>
+      <div style={{ fontSize: 11, color: "#94a3b8", fontWeight: 700, marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 26, fontWeight: 800, color, fontFamily: "monospace" }}>{value}</div>
+      {sub && <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 3 }}>{sub}</div>}
     </div>
   );
 }
 
-function MiniBar({ label, count, total, color }: { label: string; count: number; total: number; color: string }) {
-  const pct = total > 0 ? Math.round(count / total * 100) : 0;
-  return (
-    <div style={{ marginBottom: 10 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 3 }}>
-        <span style={{ color: "#475569" }}>{label}</span>
-        <span style={{ fontFamily: "monospace", color, fontWeight: 700 }}>{count}件 ({pct}%)</span>
-      </div>
-      <div style={{ height: 6, background: "#f1f5f9", borderRadius: 3, overflow: "hidden" }}>
-        <div style={{ height: "100%", width: `${pct}%`, background: color, borderRadius: 3, transition: "width 0.6s ease" }} />
-      </div>
-    </div>
-  );
-}
-
-function LogEntry({ log, canConfirm, canNotify, onClose, onConfirm, onNotify }: {
-  log: ReviewLog; canConfirm: boolean; canNotify: boolean;
-  onClose(id: number): void; onConfirm(id: number): void; onNotify(id: number): void;
-}) {
-  const sc = SC[log.status] ?? SC.issue;
-  const rc = RC[log.role] ?? { icon: "○", accent: "#64748b" };
-  return (
-    <div style={{ borderLeft: `3px solid ${rc.accent}`, background: sc.bg,
-                  borderRadius: "0 8px 8px 0", padding: "13px 16px", marginBottom: 8,
-                  position: "relative", boxShadow: "0 1px 2px rgba(0,0,0,0.05)",
-                  opacity: log.status === "close" ? 0.6 : 1, transition: "opacity 0.2s" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 7, flexWrap: "wrap" }}>
-        <span style={{ color: rc.accent, fontSize: 16, fontFamily: "monospace" }}>{rc.icon}</span>
-        <span style={{ fontWeight: 700, color: rc.accent, fontSize: 13 }}>{log.role}</span>
-        <span style={{ fontSize: 12, color: "#94a3b8" }}>{log.author}</span>
-        <span style={{ fontFamily: "monospace", fontSize: 10, color: "#94a3b8",
-                       background: "#f1f5f9", border: "1px solid #e2e8f0",
-                       borderRadius: 3, padding: "1px 5px" }}>v{log.version}</span>
-        <div style={{ marginLeft: "auto", display: "flex", gap: 5, alignItems: "center" }}>
-          <Badge s={log.status} />
-          <span style={{ fontSize: 10, color: "#94a3b8", fontFamily: "monospace" }}>{log.created_at}</span>
-        </div>
-      </div>
-      <p style={{ margin: 0, fontSize: 13.5, lineHeight: 1.75, color: "#1e293b", whiteSpace: "pre-wrap" }}>{log.comment}</p>
-      {log.confirmed_by && (
-        <div style={{ marginTop: 7, fontSize: 11, color: "#64748b" }}>
-          ✓ {log.confirmed_by} が確定（{log.confirmed_at}）
-        </div>
-      )}
-      {log.status !== "close" && (
-        <div style={{ position: "absolute", top: 10, right: 10, display: "flex", gap: 4 }}>
-          {canNotify  && <Btn color="#0ea5e9" title="通知" onClick={() => onNotify(log.id)}>📡</Btn>}
-          {canConfirm && <Btn color="#16a34a" title="確定" onClick={() => onConfirm(log.id)}>✓</Btn>}
-          <Btn color="#94a3b8" title="クローズ" onClick={() => onClose(log.id)}>✕</Btn>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function Btn({ color, title, onClick, children }: React.PropsWithChildren<{ color: string; title?: string; onClick(): void }>) {
-  return (
-    <button onClick={onClick} title={title} style={{ background: "none", border: `1px solid ${color}`,
-      borderRadius: 4, cursor: "pointer", color, fontSize: 11, padding: "2px 6px", fontWeight: 700 }}>
-      {children}
-    </button>
-  );
-}
-
-function FormRow({ label, children, flex }: React.PropsWithChildren<{ label: string; flex?: number }>) {
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 3, flex }}>
-      <label style={{ fontSize: 10, color: "#94a3b8", fontWeight: 700, letterSpacing: 0.5 }}>{label}</label>
-      {children}
-    </div>
-  );
-}
-
-function Dashboard({ logs, onNav }: { logs: ReviewLog[]; onNav(v: View): void }) {
-  const total = logs.length;
-  const issue  = logs.filter(l => l.status === "issue").length;
-  const reply  = logs.filter(l => l.status === "reply").length;
-  const review = logs.filter(l => l.status === "review").length;
-  const closed = logs.filter(l => l.status === "close").length;
-  const open   = total - closed;
-  const closeRate = total > 0 ? Math.round(closed / total * 100) : 0;
-  const maxVer = logs.length > 0 ? Math.max(...logs.map(l => l.version)) : 0;
-  const recent = [...logs].reverse().slice(0, 5);
+// ── ダッシュボード ─────────────────────────────────────
+function Dashboard({ systems, onNav }: { systems: SystemRow[]; onNav: (v: View, id?: number) => void }) {
+  const totalThreads = systems.reduce((s, x) => s + x.thread_count, 0);
+  const totalOpen    = systems.reduce((s, x) => s + x.open_count, 0);
+  const totalClosed  = totalThreads - totalOpen;
+  const rate = totalThreads > 0 ? Math.round(totalClosed / totalThreads * 100) : 0;
 
   return (
     <div>
-      <h2 style={{ fontSize: 15, fontWeight: 700, color: "#0f172a", margin: "0 0 18px" }}>ダッシュボード</h2>
+      <h2 style={S.h2}>ダッシュボード</h2>
       <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
-        <KpiCard label="総スレッド"    value={total}        color="#475569" />
-        <KpiCard label="未解決指摘"    value={issue}        color="#ef4444" sub="対応が必要" />
-        <KpiCard label="オープン"      value={open}         color="#f59e0b" />
-        <KpiCard label="確定済み"      value={closed}       color="#22c55e" sub={`${closeRate}% 完了`} />
-        <KpiCard label="最新バージョン" value={`v${maxVer}`} color="#6366f1" />
+        <KpiCard label="評価対象システム" value={systems.length} color="#6366f1" />
+        <KpiCard label="スレッド合計" value={totalThreads} color="#475569" />
+        <KpiCard label="未解決" value={totalOpen} color="#ef4444" sub="対応が必要" />
+        <KpiCard label="確定済み" value={totalClosed} color="#22c55e" sub={`${rate}% 完了`} />
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
-        <div style={{ background: "#fff", borderRadius: 10, padding: "18px 20px", boxShadow: "0 1px 3px rgba(0,0,0,0.07)" }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: "#475569", marginBottom: 14 }}>種別分布</div>
-          <MiniBar label="指摘 (issue)"    count={issue}  total={total} color="#ef4444" />
-          <MiniBar label="回答 (reply)"    count={reply}  total={total} color="#22c55e" />
-          <MiniBar label="再評価 (review)" count={review} total={total} color="#f59e0b" />
-          <MiniBar label="確定 (close)"    count={closed} total={total} color="#94a3b8" />
+      <div style={S.card}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: "#475569", marginBottom: 14 }}>
+          評価対象システム一覧
         </div>
-        <div style={{ background: "#fff", borderRadius: 10, padding: "18px 20px", boxShadow: "0 1px 3px rgba(0,0,0,0.07)" }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: "#475569", marginBottom: 14 }}>処理状況</div>
-          <div style={{ display: "flex", alignItems: "center", gap: 24, justifyContent: "center", padding: "8px 0" }}>
-            <div style={{ position: "relative", width: 100, height: 100 }}>
-              <svg viewBox="0 0 36 36" style={{ transform: "rotate(-90deg)", width: 100, height: 100 }}>
-                <circle cx="18" cy="18" r="15.9" fill="none" stroke="#f1f5f9" strokeWidth="3.5" />
-                {total > 0 && (
-                  <circle cx="18" cy="18" r="15.9" fill="none" stroke="#22c55e" strokeWidth="3.5"
-                    strokeDasharray={`${closeRate} ${100 - closeRate}`} strokeLinecap="round" />
-                )}
-              </svg>
-              <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column",
-                            alignItems: "center", justifyContent: "center" }}>
-                <span style={{ fontSize: 20, fontWeight: 800, color: "#0f172a", fontFamily: "monospace" }}>{closeRate}%</span>
-                <span style={{ fontSize: 9, color: "#94a3b8" }}>完了率</span>
+        {systems.length === 0
+          ? <div style={S.empty}>システムが登録されていません</div>
+          : systems.map(s => (
+              <div key={s.id} onClick={() => onNav("rally", s.id)}
+                style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 0",
+                         borderBottom: "1px solid #f1f5f9", cursor: "pointer" }}
+                onMouseEnter={e => (e.currentTarget.style.background = "#f8fafc")}
+                onMouseLeave={e => (e.currentTarget.style.background = "")}>
+                <div style={{ width: 36, height: 36, borderRadius: 8, background: "#eef2ff",
+                              display: "flex", alignItems: "center", justifyContent: "center",
+                              fontSize: 16, flexShrink: 0 }}>⊞</div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 700, fontSize: 13 }}>{s.name}</div>
+                  <div style={{ fontSize: 11, color: "#94a3b8" }}>{s.department || "—"}</div>
+                </div>
+                <div style={{ display: "flex", gap: 8, fontSize: 11, color: "#64748b" }}>
+                  <span>事業 {s.project_count}件</span>
+                  <span>スレッド {s.thread_count}件</span>
+                  {s.open_count > 0 && (
+                    <span style={{ color: "#ef4444", fontWeight: 700 }}>未解決 {s.open_count}件</span>
+                  )}
+                </div>
               </div>
-            </div>
-            <div style={{ fontSize: 12 }}>
-              {([["確定済み", closed, "#22c55e"], ["未対応", open, "#f59e0b"]] as const).map(([l, v, c]) => (
-                <div key={l} style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 6 }}>
-                  <span style={{ width: 10, height: 10, borderRadius: "50%", background: c, display: "inline-block" }} />
-                  <span style={{ color: "#475569" }}>{l}</span>
-                  <span style={{ fontWeight: 700, color: c, fontFamily: "monospace", marginLeft: "auto" }}>{v}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
-      <div style={{ background: "#fff", borderRadius: 10, padding: "18px 20px", boxShadow: "0 1px 3px rgba(0,0,0,0.07)" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
-          <span style={{ fontSize: 12, fontWeight: 700, color: "#475569" }}>直近アクティビティ（5件）</span>
-          <button onClick={() => onNav("rally")} style={{ background: "none", border: "1px solid #e2e8f0",
-            borderRadius: 5, fontSize: 11, color: "#64748b", padding: "3px 10px", cursor: "pointer" }}>
-            すべて表示 →
-          </button>
-        </div>
-        {recent.length === 0
-          ? <div style={{ textAlign: "center", color: "#94a3b8", padding: 20, fontSize: 13 }}>データなし</div>
-          : recent.map(log => {
-              const rc2 = RC[log.role] ?? { icon: "○", accent: "#64748b" };
-              return (
-                <div key={log.id} style={{ display: "flex", alignItems: "flex-start", gap: 10,
-                                           padding: "9px 0", borderBottom: "1px solid #f8fafc" }}>
-                  <span style={{ color: rc2.accent, fontFamily: "monospace", fontSize: 15, marginTop: 1 }}>{rc2.icon}</span>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 2 }}>
-                      <span style={{ fontSize: 12, fontWeight: 700, color: rc2.accent }}>{log.role}</span>
-                      <span style={{ fontSize: 11, color: "#94a3b8" }}>{log.author}</span>
-                      <Badge s={log.status} />
-                      <span style={{ fontSize: 10, color: "#94a3b8", marginLeft: "auto", fontFamily: "monospace" }}>{log.created_at}</span>
-                    </div>
-                    <p style={{ margin: 0, fontSize: 12, color: "#475569", overflow: "hidden",
-                                textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{log.comment}</p>
-                  </div>
-                </div>
-              );
-            })}
+            ))
+        }
       </div>
     </div>
   );
 }
 
-export default function App() {
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [projectId, setProjectId] = useState(1);
-  const [logs, setLogs]   = useState<ReviewLog[]>([]);
-  const [audit, setAudit] = useState<AuditEntry[]>([]);
-  const [hooks, setHooks] = useState<WebhookLog[]>([]);
-  const [view, setView]   = useState<View>("dashboard");
-  const [comment, setComment] = useState("");
-  const [author, setAuthor]   = useState("山田主任");
-  const [role,   setRole]     = useState("PJMO");
-  const [status, setStatus]   = useState<Status>("reply");
-  const [aiText, setAiText]   = useState("");
-  const [loading, setLoading]     = useState(false);
-  const [aiLoading, setAiLoading] = useState(false);
-  const [currentRole, setCurrentRole] = useState<UserRole>("pjmo");
-  const [toast, setToast]   = useState<string | null>(null);
-  const [sideOpen, setSideOpen] = useState(true);
+// ── システム管理 ────────────────────────────────────────
+function SystemsView({ headers, showToast }: { headers: () => Record<string, string>; showToast: (m: string) => void }) {
+  const [systems, setSystems] = useState<SystemRow[]>([]);
+  const [projects, setProjects] = useState<Record<number, ProjectRow[]>>({});
+  const [expandedSys, setExpandedSys] = useState<number | null>(null);
+  const [showNewSys, setShowNewSys] = useState(false);
+  const [showNewPj, setShowNewPj] = useState<number | null>(null);
+  const [newSysName, setNewSysName] = useState("");
+  const [newSysDept, setNewSysDept] = useState("");
+  const [newPj, setNewPj] = useState({ name: "", cost_category: "", amount_single: "", amount_advance: "", amount_deferred: "", evaluator_name: "" });
 
-  const canConfirm = currentRole === "admin" || currentRole === "evaluator";
-  const canExport  = currentRole === "admin" || currentRole === "evaluator";
-  const canNotify  = currentRole === "admin" || currentRole === "pjmo";
-
-  const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 3000); };
-  const headers = () => ({ "X-User-Name": author, "X-User-Role": currentRole });
-
-  const loadProjects = useCallback(() => {
-    fetch(`${API}/projects/`).then(r => r.json()).then(setProjects).catch(console.error);
+  const loadSystems = useCallback(() => {
+    fetch(`${API}/systems/`, { headers: headers() }).then(r => r.json()).then(setSystems);
   }, []);
-  const loadLogs = useCallback(() => {
-    fetch(`${API}/review/${projectId}`, { headers: headers() })
-      .then(r => r.json()).then(setLogs).catch(console.error);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, currentRole]);
-  const loadAudit = useCallback(() => {
-    fetch(`${API}/review/${projectId}/audit`, { headers: headers() })
-      .then(r => r.json()).then(setAudit).catch(console.error);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, currentRole]);
-  const loadHooks = useCallback(() => {
-    fetch(`${API}/notify/logs/${projectId}`, { headers: headers() })
-      .then(r => r.json()).then(setHooks).catch(console.error);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, currentRole]);
 
-  useEffect(() => { loadProjects(); }, [loadProjects]);
-  useEffect(() => { loadLogs(); }, [loadLogs]);
-  useEffect(() => { if (view === "audit")   loadAudit(); }, [view, loadAudit]);
-  useEffect(() => { if (view === "webhook") loadHooks(); }, [view, loadHooks]);
-
-  const sendComment = () => {
-    if (!comment.trim()) return;
-    setLoading(true);
-    fetch(`${API}/review/`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...headers() },
-      body: JSON.stringify({ project_id: projectId, author, role, comment, status }),
-    }).then(() => { setComment(""); loadLogs(); showToast("送信しました"); })
-      .finally(() => setLoading(false));
-  };
-  const closeLog = (id: number) => {
-    fetch(`${API}/review/${id}`, { method: "DELETE", headers: headers() })
-      .then(() => { loadLogs(); showToast("クローズしました"); });
-  };
-  const confirmLog = (id: number) => {
-    fetch(`${API}/review/${id}/confirm`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...headers() },
-      body: JSON.stringify({ confirmed_by: author }),
-    }).then(() => { loadLogs(); showToast("評価を確定しました"); });
-  };
-  const notifyLog = (id: number) => {
-    fetch(`${API}/notify/review/${id}`, {
-      method: "POST", headers: { "Content-Type": "application/json", ...headers() },
-    }).then(() => showToast("通知を送信しました（Agent Card形式）"));
-  };
-  const sendAi = () => {
-    if (!aiText.trim()) return;
-    setAiLoading(true);
-    fetch(`${API}/review/auto`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...headers() },
-      body: JSON.stringify({ project_id: projectId, text: aiText }),
-    })
-      .then(r => r.json())
-      .then(() => { setAiText(""); setView("rally"); loadLogs(); showToast("AIレビューを登録しました"); })
-      .catch(e => alert("AI APIエラー: " + e.message))
-      .finally(() => setAiLoading(false));
-  };
-  const exportFile = (type: "excel" | "pdf") => {
-    fetch(`${API}/export/${projectId}/${type}`, { headers: headers() })
-      .then(r => { if (!r.ok) throw new Error("エクスポートエラー"); return r.blob(); })
-      .then(blob => {
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `review_pj${projectId}.${type === "excel" ? "xlsx" : "pdf"}`;
-        a.click();
-        URL.revokeObjectURL(url);
-        showToast(`${type.toUpperCase()} をダウンロードしました`);
-      }).catch(e => alert(e.message));
+  const loadProjects = (sysId: number) => {
+    fetch(`${API}/systems/${sysId}/projects`, { headers: headers() })
+      .then(r => r.json()).then(data => setProjects(p => ({ ...p, [sysId]: data })));
   };
 
-  const issueCount = logs.filter(l => l.status === "issue").length;
-  const currentProject = projects.find(p => p.id === projectId);
+  useEffect(() => { loadSystems(); }, [loadSystems]);
+
+  const createSystem = () => {
+    if (!newSysName.trim()) return;
+    fetch(`${API}/systems/`, { method: "POST",
+      headers: { "Content-Type": "application/json", ...headers() },
+      body: JSON.stringify({ name: newSysName, department: newSysDept })
+    }).then(() => { setNewSysName(""); setNewSysDept(""); setShowNewSys(false); loadSystems(); showToast("システムを追加しました"); });
+  };
+
+  const createProject = (sysId: number) => {
+    if (!newPj.name.trim()) return;
+    fetch(`${API}/projects/`, { method: "POST",
+      headers: { "Content-Type": "application/json", ...headers() },
+      body: JSON.stringify({ system_id: sysId, name: newPj.name,
+        cost_category: newPj.cost_category || null,
+        amount_single: Number(newPj.amount_single) || 0,
+        amount_advance: Number(newPj.amount_advance) || 0,
+        amount_deferred: Number(newPj.amount_deferred) || 0,
+        evaluator_name: newPj.evaluator_name || null })
+    }).then(() => {
+      setNewPj({ name: "", cost_category: "", amount_single: "", amount_advance: "", amount_deferred: "", evaluator_name: "" });
+      setShowNewPj(null); loadProjects(sysId); loadSystems(); showToast("事業を追加しました");
+    });
+  };
+
+  const fmtAmount = (n: number) => n > 0 ? `${n.toLocaleString()} 千円` : "—";
 
   return (
-    <div style={{ display: "flex", minHeight: "100vh", background: "#f1f5f9", fontFamily: "'Noto Sans JP',sans-serif" }}>
-      {toast && (
-        <div style={{ position: "fixed", top: 20, right: 20, zIndex: 9999, background: "#0f172a", color: "#fff",
-                      padding: "10px 20px", borderRadius: 8, fontSize: 13, boxShadow: "0 4px 12px rgba(0,0,0,0.3)" }}>
-          {toast}
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+        <h2 style={{ ...S.h2, margin: 0 }}>システム管理</h2>
+        <button onClick={() => setShowNewSys(true)} style={btn("#4338ca")}>＋ システム追加</button>
+      </div>
+
+      {/* 新規システムモーダル */}
+      {showNewSys && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.4)", zIndex: 1000,
+                      display: "flex", alignItems: "center", justifyContent: "center" }}
+             onClick={() => setShowNewSys(false)}>
+          <div style={{ ...S.card, width: 400 }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ margin: "0 0 16px", fontSize: 15 }}>評価対象システムを追加</h3>
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 4 }}>システム名 *</label>
+              <input value={newSysName} onChange={e => setNewSysName(e.target.value)}
+                placeholder="例：人事給与システム（次期）"
+                style={{ ...S.input, width: "100%", boxSizing: "border-box" as const }} />
+            </div>
+            <div style={{ marginBottom: 20 }}>
+              <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 4 }}>担当部署</label>
+              <input value={newSysDept} onChange={e => setNewSysDept(e.target.value)}
+                placeholder="例：人事院"
+                style={{ ...S.input, width: "100%", boxSizing: "border-box" as const }} />
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button onClick={() => setShowNewSys(false)} style={chipBtn()}>キャンセル</button>
+              <button onClick={createSystem} disabled={!newSysName.trim()} style={btn("#0f172a", !newSysName.trim())}>追加</button>
+            </div>
+          </div>
         </div>
       )}
-      <aside style={{ width: sideOpen ? 200 : 52, transition: "width 0.25s ease", background: "#0f172a",
+
+      {systems.length === 0
+        ? <div style={{ ...S.card, ...S.empty }}>システムが登録されていません</div>
+        : systems.map(s => (
+          <div key={s.id} style={{ ...S.card, marginBottom: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 700, fontSize: 14 }}>{s.name}</div>
+                <div style={{ fontSize: 12, color: "#64748b" }}>{s.department || "担当部署未設定"}</div>
+              </div>
+              <div style={{ fontSize: 11, color: "#64748b", display: "flex", gap: 10 }}>
+                <span>事業 {s.project_count}件</span>
+                <span>スレッド {s.thread_count}件</span>
+                {s.open_count > 0 && <span style={{ color: "#ef4444", fontWeight: 700 }}>未解決 {s.open_count}件</span>}
+              </div>
+              <button onClick={() => {
+                if (expandedSys === s.id) { setExpandedSys(null); }
+                else { setExpandedSys(s.id); loadProjects(s.id); }
+              }} style={chipBtn()}>
+                {expandedSys === s.id ? "▲ 閉じる" : "▼ 事業一覧"}
+              </button>
+            </div>
+
+            {expandedSys === s.id && (
+              <div style={{ marginTop: 14, borderTop: "1px solid #f1f5f9", paddingTop: 14 }}>
+                {(projects[s.id] || []).map(p => (
+                  <div key={p.id} style={{ padding: "10px 0", borderBottom: "1px solid #f8fafc" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <div style={{ flex: 1 }}>
+                        <span style={{ fontWeight: p.is_system_wide ? 400 : 700, fontSize: 13,
+                                       color: p.is_system_wide ? "#94a3b8" : "#0f172a" }}>
+                          {p.is_system_wide ? "📌 システム全体" : p.name}
+                        </span>
+                        {!p.is_system_wide && p.cost_category && (
+                          <span style={{ fontSize: 10, marginLeft: 8, padding: "1px 7px", borderRadius: 4,
+                                         background: "#f1f5f9", color: "#475569" }}>{p.cost_category}</span>
+                        )}
+                      </div>
+                      {!p.is_system_wide && (
+                        <div style={{ fontSize: 11, color: "#64748b", display: "flex", gap: 10 }}>
+                          <span>単歳 {fmtAmount(p.amount_single)}</span>
+                          {p.amount_deferred > 0 && <span>後年 {fmtAmount(p.amount_deferred)}</span>}
+                          {p.evaluator_name && <span>評価者: {p.evaluator_name}</span>}
+                        </div>
+                      )}
+                      <span style={{ fontSize: 11, color: p.open_count > 0 ? "#ef4444" : "#22c55e" }}>
+                        {p.thread_count}件 {p.open_count > 0 ? `(未解決${p.open_count})` : "(完了)"}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+                <div style={{ marginTop: 12 }}>
+                  {showNewPj === s.id ? (
+                    <div style={{ background: "#f8fafc", borderRadius: 8, padding: 14 }}>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+                        <div>
+                          <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>事業名 *</label>
+                          <input value={newPj.name} onChange={e => setNewPj(p => ({ ...p, name: e.target.value }))}
+                            style={{ ...S.input, width: "100%", boxSizing: "border-box" as const }} />
+                        </div>
+                        <div>
+                          <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>経費区分</label>
+                          <select value={newPj.cost_category} onChange={e => setNewPj(p => ({ ...p, cost_category: e.target.value }))}
+                            style={{ ...S.input, width: "100%" }}>
+                            <option value="">選択してください</option>
+                            {COST_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+                          </select>
+                        </div>
+                        <div>
+                          <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>単歳要求額（千円）</label>
+                          <input type="number" value={newPj.amount_single}
+                            onChange={e => setNewPj(p => ({ ...p, amount_single: e.target.value }))}
+                            style={{ ...S.input, width: "100%", boxSizing: "border-box" as const }} />
+                        </div>
+                        <div>
+                          <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>後年度負担金（千円）</label>
+                          <input type="number" value={newPj.amount_deferred}
+                            onChange={e => setNewPj(p => ({ ...p, amount_deferred: e.target.value }))}
+                            style={{ ...S.input, width: "100%", boxSizing: "border-box" as const }} />
+                        </div>
+                        <div>
+                          <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>評価者名</label>
+                          <input value={newPj.evaluator_name}
+                            onChange={e => setNewPj(p => ({ ...p, evaluator_name: e.target.value }))}
+                            placeholder="例：田中係長"
+                            style={{ ...S.input, width: "100%", boxSizing: "border-box" as const }} />
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                        <button onClick={() => setShowNewPj(null)} style={chipBtn()}>キャンセル</button>
+                        <button onClick={() => createProject(s.id)} disabled={!newPj.name.trim()}
+                          style={btn("#0f172a", !newPj.name.trim())}>追加</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <button onClick={() => setShowNewPj(s.id)} style={chipBtn("#4338ca")}>＋ 事業追加</button>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        ))
+      }
+    </div>
+  );
+}
+
+// ── 評価ラリー ─────────────────────────────────────────
+function RallyView({ initialSystemId, headers, showToast, currentRole }:
+  { initialSystemId?: number; headers: () => Record<string, string>;
+    showToast: (m: string) => void; currentRole: UserRole }) {
+
+  const [systems, setSystems]   = useState<SystemRow[]>([]);
+  const [projects, setProjects] = useState<ProjectRow[]>([]);
+  const [threads, setThreads]   = useState<ThreadRow[]>([]);
+  const [entries, setEntries]   = useState<EntryRow[]>([]);
+  const [selSys, setSelSys]     = useState<number | null>(initialSystemId || null);
+  const [selPj, setSelPj]       = useState<number | null>(null);
+  const [selThread, setSelThread] = useState<number | null>(null);
+
+  const [showNewThread, setShowNewThread] = useState(false);
+  const [newThread, setNewThread] = useState({ title: "", comment: "", due_date: "", entry_date: "" });
+  const [newEntry, setNewEntry]   = useState({ entry_type: "reply" as "reply"|"review"|"close", comment: "", entry_date: "" });
+  const [aiText, setAiText]       = useState("");
+  const [loading, setLoading]     = useState(false);
+
+  const canEvaluator = currentRole === "admin" || currentRole === "evaluator";
+  const canPjmo      = currentRole === "admin" || currentRole === "pjmo";
+
+  useEffect(() => {
+    fetch(`${API}/systems/`, { headers: headers() }).then(r => r.json()).then(data => {
+      setSystems(data);
+      if (initialSystemId) setSelSys(initialSystemId);
+      else if (data.length > 0) setSelSys(data[0].id);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!selSys) return;
+    fetch(`${API}/systems/${selSys}/projects`, { headers: headers() }).then(r => r.json()).then(data => {
+      setProjects(data);
+      setSelPj(data[0]?.id || null);
+    });
+  }, [selSys]);
+
+  useEffect(() => {
+    if (!selPj) return;
+    fetch(`${API}/threads/${selPj}`, { headers: headers() }).then(r => r.json()).then(setThreads);
+    setSelThread(null); setEntries([]);
+  }, [selPj]);
+
+  useEffect(() => {
+    if (!selThread) return;
+    fetch(`${API}/threads/${selThread}/entries`, { headers: headers() }).then(r => r.json()).then(setEntries);
+  }, [selThread]);
+
+  const reloadThreads = () => {
+    if (!selPj) return;
+    fetch(`${API}/threads/${selPj}`, { headers: headers() }).then(r => r.json()).then(setThreads);
+  };
+  const reloadEntries = () => {
+    if (!selThread) return;
+    fetch(`${API}/threads/${selThread}/entries`, { headers: headers() }).then(r => r.json()).then(setEntries);
+  };
+
+  const createThread = () => {
+    if (!newThread.comment.trim() || !selPj) return;
+    setLoading(true);
+    fetch(`${API}/threads/`, { method: "POST",
+      headers: { "Content-Type": "application/json", ...headers() },
+      body: JSON.stringify({ project_id: selPj, ...newThread })
+    }).then(() => {
+      setNewThread({ title: "", comment: "", due_date: "", entry_date: "" });
+      setShowNewThread(false); reloadThreads(); showToast("指摘を追加しました");
+    }).finally(() => setLoading(false));
+  };
+
+  const addEntry = () => {
+    if (!newEntry.comment.trim() || !selThread) return;
+    setLoading(true);
+    fetch(`${API}/threads/${selThread}/entries`, { method: "POST",
+      headers: { "Content-Type": "application/json", ...headers() },
+      body: JSON.stringify(newEntry)
+    }).then(() => {
+      setNewEntry({ entry_type: "reply", comment: "", entry_date: "" });
+      reloadEntries(); reloadThreads(); showToast("投稿しました");
+    }).finally(() => setLoading(false));
+  };
+
+  const runAI = () => {
+    if (!aiText.trim() || !selPj) return;
+    setLoading(true);
+    fetch(`${API}/threads/auto`, { method: "POST",
+      headers: { "Content-Type": "application/json", ...headers() },
+      body: JSON.stringify({ project_id: selPj, content: aiText })
+    }).then(() => {
+      setAiText(""); reloadThreads(); showToast("AI指摘を追加しました");
+    }).catch(e => alert("エラー: " + e.message))
+    .finally(() => setLoading(false));
+  };
+
+  const curThread = threads.find(t => t.id === selThread);
+
+  return (
+    <div style={{ display: "flex", height: "calc(100vh - 94px)", gap: 0 }}>
+      {/* 左ペイン: システム/事業選択 */}
+      <div style={{ width: 220, flexShrink: 0, borderRight: "1px solid #e2e8f0",
+                    overflowY: "auto", background: "#f8fafc" }}>
+        <div style={{ padding: "10px 12px", borderBottom: "1px solid #e2e8f0" }}>
+          <select value={selSys || ""} onChange={e => setSelSys(Number(e.target.value))}
+            style={{ ...S.input, width: "100%", fontSize: 12 }}>
+            {systems.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </div>
+        <div style={{ padding: "8px 0" }}>
+          {projects.map(p => (
+            <div key={p.id} onClick={() => setSelPj(p.id)}
+              style={{ padding: "9px 14px", cursor: "pointer", fontSize: 12,
+                       background: selPj === p.id ? "#e0e7ff" : "transparent",
+                       borderLeft: selPj === p.id ? "3px solid #4338ca" : "3px solid transparent",
+                       color: p.is_system_wide ? "#94a3b8" : "#1e293b" }}>
+              <div style={{ fontWeight: selPj === p.id ? 700 : 400 }}>
+                {p.is_system_wide ? "📌 システム全体" : p.name}
+              </div>
+              {!p.is_system_wide && (
+                <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 2 }}>
+                  {p.cost_category || "経費区分未設定"}
+                  {p.open_count > 0 && <span style={{ color: "#ef4444", marginLeft: 6 }}>未解決{p.open_count}</span>}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* 中央ペイン: スレッド一覧 */}
+      <div style={{ width: 280, flexShrink: 0, borderRight: "1px solid #e2e8f0",
+                    overflowY: "auto", background: "#fff" }}>
+        <div style={{ padding: "10px 12px", borderBottom: "1px solid #e2e8f0",
+                      display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: "#475569" }}>指摘スレッド</span>
+          <div style={{ display: "flex", gap: 4 }}>
+            {canEvaluator && (
+              <button onClick={() => setShowNewThread(true)} style={chipBtn("#4338ca")}>＋ 指摘</button>
+            )}
+          </div>
+        </div>
+
+        {threads.length === 0
+          ? <div style={{ ...S.empty, fontSize: 12 }}>指摘がありません</div>
+          : threads.map(t => (
+              <div key={t.id} onClick={() => setSelThread(t.id)}
+                style={{ padding: "10px 12px", cursor: "pointer", borderBottom: "1px solid #f8fafc",
+                         background: selThread === t.id ? "#f0f4ff" : "transparent" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                  <span style={{ fontSize: 11, color: "#94a3b8", fontFamily: "monospace" }}>#{t.thread_no}</span>
+                  <StatusBadge status={t.status} />
+                </div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: "#1e293b", marginBottom: 4 }}>
+                  {t.title || `指摘 #${t.thread_no}`}
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#94a3b8" }}>
+                  <span>{t.entry_count}件の投稿</span>
+                  {t.due_date && <span style={{ color: "#f59e0b" }}>期限: {t.due_date}</span>}
+                </div>
+              </div>
+            ))
+        }
+
+        {/* AI指摘生成 */}
+        {canEvaluator && selPj && (
+          <div style={{ padding: "10px 12px", borderTop: "1px solid #e2e8f0" }}>
+            <div style={{ fontSize: 11, color: "#6b21a8", fontWeight: 700, marginBottom: 6 }}>🤖 AI自動指摘</div>
+            <textarea value={aiText} onChange={e => setAiText(e.target.value)}
+              placeholder="仕様書・見積書を貼り付け..."
+              rows={3}
+              style={{ ...S.input, width: "100%", resize: "vertical", boxSizing: "border-box" as const, fontSize: 11 }} />
+            <button onClick={runAI} disabled={loading || !aiText.trim()}
+              style={{ ...btn("#6b21a8", loading || !aiText.trim()), marginTop: 6, width: "100%", fontSize: 11 }}>
+              {loading ? "生成中..." : "AI指摘を生成"}
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* 右ペイン: スレッド詳細 */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflowY: "auto" }}>
+        {!selThread ? (
+          <div style={{ ...S.empty, marginTop: 60 }}>スレッドを選択してください</div>
+        ) : (
+          <>
+            {/* スレッドヘッダー */}
+            <div style={{ padding: "12px 16px", borderBottom: "1px solid #e2e8f0", background: "#fff" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontFamily: "monospace", fontSize: 12, color: "#94a3b8" }}>#{curThread?.thread_no}</span>
+                <span style={{ fontWeight: 700, fontSize: 14 }}>{curThread?.title || "（タイトルなし）"}</span>
+                {curThread && <StatusBadge status={curThread.status} />}
+              </div>
+              {curThread?.due_date && (
+                <div style={{ fontSize: 11, color: "#f59e0b", marginTop: 4 }}>期限: {curThread.due_date}</div>
+              )}
+            </div>
+
+            {/* 投稿一覧 */}
+            <div style={{ flex: 1, overflowY: "auto", padding: "12px 16px" }}>
+              {entries.map(e => {
+                const rc = ROLE_ICON[e.role];
+                const tc = ENTRY_TYPE[e.entry_type];
+                return (
+                  <div key={e.id} style={{ borderLeft: `3px solid ${rc.color}`, background: tc.bg,
+                                           borderRadius: "0 8px 8px 0", padding: "12px 14px",
+                                           marginBottom: 10 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" as const }}>
+                      <span style={{ color: rc.color, fontSize: 14, fontFamily: "monospace" }}>{rc.icon}</span>
+                      <span style={{ fontWeight: 700, color: rc.color, fontSize: 12 }}>{rc.label}</span>
+                      <span style={{ fontFamily: "monospace", fontSize: 10, color: "#94a3b8",
+                                     background: "#f1f5f9", borderRadius: 3, padding: "1px 5px" }}>seq.{e.seq}</span>
+                      <div style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
+                        <TypeBadge type={e.entry_type} />
+                        <span style={{ fontSize: 10, color: "#94a3b8", fontFamily: "monospace" }}>
+                          {e.entry_date || e.created_at}
+                        </span>
+                      </div>
+                    </div>
+                    <p style={{ margin: 0, fontSize: 13, lineHeight: 1.75, whiteSpace: "pre-wrap" }}>{e.comment}</p>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* 新規投稿フォーム */}
+            {curThread?.status !== "closed" && (
+              <div style={{ padding: "12px 16px", borderTop: "1px solid #e2e8f0", background: "#fff" }}>
+                <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                  <select value={newEntry.entry_type}
+                    onChange={e => setNewEntry(n => ({ ...n, entry_type: e.target.value as any }))}
+                    style={{ ...S.input }}>
+                    {canPjmo && <option value="reply">回答（PJMO）</option>}
+                    {canEvaluator && <option value="review">再評価（評価者）</option>}
+                    {canEvaluator && <option value="close">確定（評価者）</option>}
+                  </select>
+                  <input type="date" value={newEntry.entry_date}
+                    onChange={e => setNewEntry(n => ({ ...n, entry_date: e.target.value }))}
+                    style={{ ...S.input }} />
+                </div>
+                <textarea value={newEntry.comment}
+                  onChange={e => setNewEntry(n => ({ ...n, comment: e.target.value }))}
+                  placeholder="コメントを入力..." rows={3}
+                  style={{ ...S.input, width: "100%", resize: "vertical", boxSizing: "border-box" as const, marginBottom: 8 }} />
+                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                  <button onClick={addEntry} disabled={loading || !newEntry.comment.trim()}
+                    style={btn("#0f172a", loading || !newEntry.comment.trim())}>
+                    {loading ? "送信中..." : "投稿"}
+                  </button>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* 新規スレッドモーダル */}
+      {showNewThread && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.4)", zIndex: 1000,
+                      display: "flex", alignItems: "center", justifyContent: "center" }}
+             onClick={() => setShowNewThread(false)}>
+          <div style={{ ...S.card, width: 480 }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ margin: "0 0 16px", fontSize: 15 }}>指摘を追加</h3>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+              <div style={{ gridColumn: "1/-1" }}>
+                <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>タイトル（任意）</label>
+                <input value={newThread.title} onChange={e => setNewThread(n => ({ ...n, title: e.target.value }))}
+                  placeholder="例：積算根拠の確認"
+                  style={{ ...S.input, width: "100%", boxSizing: "border-box" as const }} />
+              </div>
+              <div>
+                <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>期限日</label>
+                <input type="date" value={newThread.due_date}
+                  onChange={e => setNewThread(n => ({ ...n, due_date: e.target.value }))}
+                  style={{ ...S.input, width: "100%" }} />
+              </div>
+              <div>
+                <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>指摘日</label>
+                <input type="date" value={newThread.entry_date}
+                  onChange={e => setNewThread(n => ({ ...n, entry_date: e.target.value }))}
+                  style={{ ...S.input, width: "100%" }} />
+              </div>
+            </div>
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>指摘内容 *</label>
+              <textarea value={newThread.comment} onChange={e => setNewThread(n => ({ ...n, comment: e.target.value }))}
+                placeholder="DS-110第○条に基づき..." rows={5}
+                style={{ ...S.input, width: "100%", resize: "vertical", boxSizing: "border-box" as const }} />
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button onClick={() => setShowNewThread(false)} style={chipBtn()}>キャンセル</button>
+              <button onClick={createThread} disabled={loading || !newThread.comment.trim()}
+                style={btn("#9b1c1c", loading || !newThread.comment.trim())}>指摘を追加</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── メインApp ──────────────────────────────────────────
+export default function App() {
+  const [view, setView]           = useState<View>("dashboard");
+  const [systems, setSystems]     = useState<SystemRow[]>([]);
+  const [currentRole, setCurrentRole] = useState<UserRole>("pjmo");
+  const [toast, setToast]         = useState<string | null>(null);
+  const [sideOpen, setSideOpen]   = useState(true);
+  const [rallySystemId, setRallySystemId] = useState<number | undefined>(undefined);
+  const [auditData, setAuditData] = useState<AuditRow[]>([]);
+  const [hookData, setHookData]   = useState<WebhookRow[]>([]);
+
+  const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 3000); };
+  const headers = () => ({
+    "X-User-Name": btoa(encodeURIComponent("ユーザー")),
+    "X-User-Role": currentRole,
+  });
+
+  const loadSystems = useCallback(() => {
+    fetch(`${API}/systems/`, { headers: headers() }).then(r => r.json()).then(setSystems);
+  }, [currentRole]);
+
+  useEffect(() => { loadSystems(); }, [loadSystems]);
+  useEffect(() => {
+    if (view === "audit")
+      fetch(`${API}/systems/`, { headers: headers() }).then(r => r.json())
+        .then(sysList => {
+          if (sysList.length > 0)
+            fetch(`${API}/threads/1`, { headers: headers() }).catch(() => {});
+        });
+  }, [view]);
+
+  const navTo = (v: View, sysId?: number) => {
+    if (v === "rally" && sysId) setRallySystemId(sysId);
+    setView(v);
+  };
+
+  return (
+    <div style={{ display: "flex", minHeight: "100vh", background: "#f1f5f9",
+                  fontFamily: "'Noto Sans JP',sans-serif" }}>
+      {toast && <Toast msg={toast} />}
+
+      {/* サイドバー */}
+      <aside style={{ width: sideOpen ? 200 : 52, transition: "width .25s", background: "#0f172a",
                       display: "flex", flexDirection: "column", flexShrink: 0, overflow: "hidden" }}>
         <div style={{ height: 54, display: "flex", alignItems: "center",
-                      padding: sideOpen ? "0 16px" : "0 14px", gap: 10, borderBottom: "1px solid #1e293b" }}>
-          <span style={{ fontFamily: "monospace", fontSize: 13, color: "#60a5fa", fontWeight: 700, letterSpacing: 2, flexShrink: 0 }}>▦</span>
-          {sideOpen && <span style={{ fontSize: 12, fontWeight: 700, color: "#e2e8f0", whiteSpace: "nowrap" }}>PJMO Review</span>}
+                      padding: sideOpen ? "0 16px" : "0 14px", gap: 10,
+                      borderBottom: "1px solid #1e293b" }}>
+          <span style={{ fontFamily: "monospace", fontSize: 13, color: "#60a5fa",
+                         fontWeight: 700, letterSpacing: 2, flexShrink: 0 }}>▦</span>
+          {sideOpen && <span style={{ fontSize: 11, fontWeight: 700, color: "#e2e8f0", whiteSpace: "nowrap" }}>
+            予算額妥当性評価
+          </span>}
           <button onClick={() => setSideOpen(v => !v)}
-            style={{ marginLeft: "auto", background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 16, padding: 0, flexShrink: 0 }}>
+            style={{ marginLeft: "auto", background: "none", border: "none",
+                     color: "#475569", cursor: "pointer", fontSize: 16, padding: 0, flexShrink: 0 }}>
             {sideOpen ? "◀" : "▶"}
           </button>
         </div>
         <nav style={{ padding: "12px 0", flex: 1 }}>
           {NAV.map(n => (
-            <button key={n.key} onClick={() => setView(n.key)}
+            <button key={n.key} onClick={() => navTo(n.key)}
               style={{ display: "flex", alignItems: "center", gap: 10, width: "100%",
                        padding: sideOpen ? "9px 16px" : "9px 14px",
-                       background: view === n.key ? "#1e293b" : "none", border: "none", cursor: "pointer",
+                       background: view === n.key ? "#1e293b" : "none", border: "none",
+                       cursor: "pointer",
                        borderLeft: view === n.key ? "3px solid #60a5fa" : "3px solid transparent",
                        color: view === n.key ? "#e2e8f0" : "#64748b",
                        fontSize: 13, fontFamily: "'Noto Sans JP',sans-serif",
-                       transition: "all 0.15s", textAlign: "left" }}>
+                       transition: "all .15s", textAlign: "left" as const }}>
               <span style={{ fontFamily: "monospace", fontSize: 14, flexShrink: 0 }}>{n.icon}</span>
               {sideOpen && <span style={{ whiteSpace: "nowrap", fontSize: 12 }}>{n.label}</span>}
             </button>
@@ -1737,146 +3599,46 @@ export default function App() {
           </div>
         )}
       </aside>
+
+      {/* メインコンテンツ */}
       <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
         <header style={{ height: 54, background: "#fff", borderBottom: "1px solid #e2e8f0",
-                         display: "flex", alignItems: "center", padding: "0 20px", gap: 14,
-                         boxShadow: "0 1px 2px rgba(0,0,0,0.04)" }}>
-          <select value={projectId} onChange={e => setProjectId(Number(e.target.value))}
-            style={{ ...S.input, minWidth: 240, fontSize: 13 }}>
-            {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-          </select>
-          {currentProject && <span style={{ fontSize: 11, color: "#94a3b8" }}>{currentProject.description}</span>}
-          <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
-            {issueCount > 0 && (
-              <span style={{ background: "#dc2626", color: "#fff", borderRadius: 12,
-                             padding: "2px 10px", fontSize: 11, fontWeight: 700 }}>
-                ⚠ 未解決指摘 {issueCount}件
-              </span>
-            )}
-            {canExport && (<>
-              <button onClick={() => exportFile("excel")} style={exportBtn("#16a34a")}>↓ Excel</button>
-              <button onClick={() => exportFile("pdf")}   style={exportBtn("#dc2626")}>↓ PDF</button>
-            </>)}
-          </div>
+                         display: "flex", alignItems: "center", padding: "0 20px",
+                         boxShadow: "0 1px 2px rgba(0,0,0,.04)" }}>
+          <span style={{ fontWeight: 700, fontSize: 14, color: "#0f172a" }}>
+            {NAV.find(n => n.key === view)?.label}
+          </span>
         </header>
-        <main style={{ flex: 1, overflowY: "auto", padding: 24 }}>
-          {view === "dashboard" && <Dashboard logs={logs} onNav={setView} />}
-          {view === "rally" && (
-            <div>
-              <h2 style={h2}>レビューラリー</h2>
-              <div style={card}>
-                {logs.length === 0
-                  ? <div style={empty}>レビュー履歴がありません</div>
-                  : logs.map(log => (
-                      <LogEntry key={log.id} log={log}
-                        canConfirm={canConfirm} canNotify={canNotify}
-                        onClose={closeLog} onConfirm={confirmLog} onNotify={notifyLog} />
-                    ))}
-                <div style={{ borderTop: "1px solid #f1f5f9", paddingTop: 18, marginTop: 8 }}>
-                  <div style={{ display: "flex", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
-                    <FormRow label="氏名" flex={1}><input value={author} onChange={e => setAuthor(e.target.value)} style={{ ...S.input, minWidth: 100 }} /></FormRow>
-                    <FormRow label="役割"><select value={role} onChange={e => setRole(e.target.value)} style={S.input}><option value="PJMO">PJMO</option><option value="評価者">評価者</option></select></FormRow>
-                    <FormRow label="種別"><select value={status} onChange={e => setStatus(e.target.value as Status)} style={S.input}><option value="issue">指摘</option><option value="reply">回答</option><option value="review">再評価</option><option value="close">確定</option></select></FormRow>
-                  </div>
-                  <textarea value={comment} onChange={e => setComment(e.target.value)}
-                    placeholder="コメントを入力..." rows={4}
-                    style={{ ...S.input, width: "100%", resize: "vertical", lineHeight: 1.6, boxSizing: "border-box", marginBottom: 10 }} />
-                  <div style={{ display: "flex", justifyContent: "flex-end" }}>
-                    <button onClick={sendComment} disabled={loading || !comment.trim()} style={primaryBtn(loading || !comment.trim())}>
-                      {loading ? "送信中..." : "送信"}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
+
+        <main style={{ flex: 1, overflow: view === "rally" || view === "advisor" ? "hidden" : "auto",
+                       padding: view === "rally" || view === "advisor" ? 0 : 24 }}>
+          {view === "dashboard" && (
+            <Dashboard systems={systems} onNav={navTo} />
           )}
-          {view === "ai" && (
-            <div>
-              <h2 style={h2}>AI自動レビュー</h2>
-              <div style={card}>
-                <p style={{ fontSize: 13, color: "#475569", lineHeight: 1.75, margin: "0 0 14px" }}>
-                  調達仕様書・見積書のテキストを貼り付けると、DS-110/DS-910の観点からClaudeが自動レビューし、
-                  指摘事項をラリーに登録します。
-                </p>
-                <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 6,
-                              padding: "9px 14px", marginBottom: 14, fontSize: 11, color: "#92400e" }}>
-                  ⚠ docker-compose の ollama サービスが起動している必要があります（モデル変更: OLLAMA_MODEL 環境変数）
-                </div>
-                <textarea value={aiText} onChange={e => setAiText(e.target.value)}
-                  placeholder="調達仕様書・見積書・要件定義書等を貼り付けてください" rows={10}
-                  style={{ ...S.input, width: "100%", resize: "vertical", lineHeight: 1.6, boxSizing: "border-box", marginBottom: 12 }} />
-                <div style={{ display: "flex", justifyContent: "flex-end" }}>
-                  <button onClick={sendAi} disabled={aiLoading || !aiText.trim()}
-                    style={{ ...primaryBtn(aiLoading || !aiText.trim()), background: aiLoading || !aiText.trim() ? "#cbd5e1" : "#7c3aed" }}>
-                    {aiLoading ? "AIレビュー中..." : "🤖 AIレビュー実行"}
-                  </button>
-                </div>
-              </div>
-            </div>
+          {view === "systems" && (
+            <SystemsView headers={headers} showToast={showToast} />
+          )}
+          {view === "rally" && (
+            <RallyView initialSystemId={rallySystemId} headers={headers}
+                       showToast={showToast} currentRole={currentRole} />
+          )}
+          {view === "advisor" && (
+            <BudgetAdvisor api={API} headers={headers} />
           )}
           {view === "audit" && (
             <div>
-              <h2 style={h2}>監査ログ</h2>
-              <div style={card}>
-                <p style={{ fontSize: 12, color: "#64748b", margin: "0 0 16px" }}>全操作の記録（直近100件）</p>
-                {audit.length === 0
-                  ? <div style={empty}>ログなし</div>
-                  : <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-                      <thead>
-                        <tr style={{ background: "#f8fafc" }}>
-                          {["日時", "ユーザー", "操作", "対象テーブル", "対象ID"].map(h => (
-                            <th key={h} style={{ padding: "8px 10px", textAlign: "left",
-                                                 borderBottom: "2px solid #e2e8f0", fontWeight: 700, color: "#475569" }}>{h}</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {audit.map((a, i) => (
-                          <tr key={i} style={{ borderBottom: "1px solid #f1f5f9" }}>
-                            <td style={td}><span style={{ fontFamily: "monospace", fontSize: 11 }}>{a.created_at}</span></td>
-                            <td style={td}>{a.user_name}</td>
-                            <td style={td}><code style={{ background: "#f1f5f9", padding: "1px 6px", borderRadius: 3, fontSize: 11 }}>{a.action}</code></td>
-                            <td style={td}>{a.target_table}</td>
-                            <td style={td}>{a.target_id}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                }
+              <h2 style={S.h2}>監査ログ</h2>
+              <div style={S.card}>
+                <p style={{ fontSize: 12, color: "#64748b", margin: "0 0 12px" }}>全操作の記録</p>
+                <p style={{ fontSize: 12, color: "#94a3b8" }}>（事業を選択して監査ログを確認してください）</p>
               </div>
             </div>
           )}
           {view === "webhook" && (
             <div>
-              <h2 style={h2}>通知履歴（MCP/Webhook）</h2>
-              <div style={card}>
-                <p style={{ fontSize: 12, color: "#64748b", margin: "0 0 16px" }}>
-                  Agent Card形式（JSON-LD）でのWebhook送信履歴
-                </p>
-                {hooks.length === 0
-                  ? <div style={empty}>送信履歴なし（ラリー画面の 📡 ボタンで送信できます）</div>
-                  : <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-                      <thead>
-                        <tr style={{ background: "#f8fafc" }}>
-                          {["ID", "イベント", "ステータス", "作成日時", "送信日時"].map(h => (
-                            <th key={h} style={{ padding: "8px 10px", textAlign: "left",
-                                                 borderBottom: "2px solid #e2e8f0", fontWeight: 700, color: "#475569" }}>{h}</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {hooks.map(w => (
-                          <tr key={w.id} style={{ borderBottom: "1px solid #f1f5f9" }}>
-                            <td style={td}>{w.id}</td>
-                            <td style={td}><code style={{ background: "#f0fdf4", padding: "1px 6px", borderRadius: 3, fontSize: 11 }}>{w.event_type}</code></td>
-                            <td style={td}><span style={{ color: w.status === "sent" ? "#16a34a" : "#dc2626", fontWeight: 700, fontSize: 11 }}>{w.status}</span></td>
-                            <td style={td}><span style={{ fontFamily: "monospace", fontSize: 11 }}>{w.created_at}</span></td>
-                            <td style={td}><span style={{ fontFamily: "monospace", fontSize: 11 }}>{w.sent_at ?? "—"}</span></td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                }
+              <h2 style={S.h2}>通知履歴</h2>
+              <div style={S.card}>
+                <p style={{ fontSize: 12, color: "#64748b", margin: 0 }}>Agent Card形式（JSON-LD）でのWebhook送信履歴</p>
               </div>
             </div>
           )}
@@ -1885,21 +3647,6 @@ export default function App() {
     </div>
   );
 }
-
-const h2: React.CSSProperties = { fontSize: 15, fontWeight: 700, color: "#0f172a", margin: "0 0 16px" };
-const card: React.CSSProperties = { background: "#fff", borderRadius: 10, padding: "22px", boxShadow: "0 1px 3px rgba(0,0,0,0.07)" };
-const empty: React.CSSProperties = { textAlign: "center", color: "#94a3b8", padding: "36px 0", fontSize: 14 };
-const td: React.CSSProperties = { padding: "8px 10px", color: "#334155" };
-const primaryBtn = (disabled: boolean): React.CSSProperties => ({
-  background: disabled ? "#cbd5e1" : "#0f172a", color: "#fff", border: "none", borderRadius: 6,
-  padding: "9px 24px", fontSize: 13, fontWeight: 700,
-  cursor: disabled ? "not-allowed" : "pointer", fontFamily: "'Noto Sans JP',sans-serif",
-});
-const exportBtn = (color: string): React.CSSProperties => ({
-  background: "none", border: `1px solid ${color}`, color, borderRadius: 5,
-  padding: "5px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer",
-  fontFamily: "'Noto Sans JP',sans-serif",
-});
 #+end_src
 
 * インフラ
@@ -1943,8 +3690,6 @@ services:
         condition: service_healthy
       ollama:
         condition: service_started
-    volumes:
-      - ./backend:/app
 
   frontend:
     build:
@@ -1953,8 +3698,8 @@ services:
       target: development
     ports:
       - "3005:3005"
-    environment:
-      REACT_APP_API_URL: http://localhost:8000
+    volumes:
+      - ./frontend/src:/app/src
     depends_on:
       - backend
 
@@ -2172,7 +3917,7 @@ OLLAMA_MODEL=qwen2.5
 
 ** .gitignore
 
-#+begin_src text :tangle .gitignore
+#+begin_src text :tangle no
 .env.prod
 .env.local
 nginx/certs/
@@ -2239,6 +3984,21 @@ docker compose exec ollama ollama pull qwen2.5:14b  # 別バリアントをpull
 docker compose restart backend
 #+end_src
 
+*** Ollamaの再起動
+
+#+begin_src shell :eval no
+# 通常の再起動
+docker compose restart ollama
+
+# OLLAMA_MODEL を変更した場合は backend も再起動
+docker compose restart ollama backend
+
+# コンテナを完全に作り直す場合
+docker compose stop ollama
+docker compose rm -f ollama
+docker compose up -d ollama
+#+end_src
+
 *** Ollamaの直接操作
 
 #+begin_src shell :eval no
@@ -2255,7 +4015,7 @@ docker compose exec ollama ollama show qwen2.5
 docker compose exec ollama ollama run qwen2.5 "DS-110とは何ですか？"
 
 # ホストから直接APIを叩く
-curl http://localhost:11434/api/chat -d '{model:qwen2.5,messages:[{role:user,content:test}],stream:false}'
+curl http://localhost:11434/api/chat   -d '{"model":"qwen2.5","messages":[{"role":"user","content":"test"}],"stream":false}'
 #+end_src
 
 ** 本番デプロイ

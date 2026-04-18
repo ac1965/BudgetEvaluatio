@@ -1,365 +1,687 @@
 import React, { useEffect, useState, useCallback } from "react";
+import { View, UserRole, SystemRow, ProjectRow, ThreadRow, EntryRow,
+         AuditRow, WebhookRow, THREAD_STATUS, ENTRY_TYPE, ROLE_ICON,
+         COST_CATEGORIES } from "./types";
+import BudgetAdvisor from "./BudgetAdvisor";
 
-type Status = "issue" | "reply" | "review" | "close";
-type UserRole = "admin" | "evaluator" | "pjmo" | "viewer";
-type View = "dashboard" | "rally" | "ai" | "audit" | "webhook";
+const API = "/api";
 
-interface ReviewLog {
-  id: number; author: string; role: string; comment: string;
-  status: Status; version: number;
-  confirmed_by: string | null; confirmed_at: string | null; created_at: string;
-}
-interface Project { id: number; name: string; description: string; }
-interface AuditEntry { user_name: string; action: string; target_table: string; target_id: number; created_at: string; }
-interface WebhookLog { id: number; event_type: string; status: string; created_at: string; sent_at: string | null; }
-
-// process.env は Vite の define で展開される
-const API = (typeof process !== "undefined" && process.env?.REACT_APP_API_URL) || "http://localhost:8000";
-
-const SC: Record<Status, { label: string; color: string; bg: string; border: string; hex: string }> = {
-  issue:  { label: "指摘",   color: "#b91c1c", bg: "#fef2f2", border: "#fca5a5", hex: "#ef4444" },
-  reply:  { label: "回答",   color: "#15803d", bg: "#f0fdf4", border: "#86efac", hex: "#22c55e" },
-  review: { label: "再評価", color: "#92400e", bg: "#fffbeb", border: "#fcd34d", hex: "#f59e0b" },
-  close:  { label: "確定",   color: "#475569", bg: "#f8fafc", border: "#cbd5e1", hex: "#94a3b8" },
+// ── スタイル定数 ─────────────────────────────────────
+const S = {
+  input: { padding: "7px 10px", border: "1px solid #e2e8f0", borderRadius: 6,
+           fontSize: 13, fontFamily: "'Noto Sans JP',sans-serif", background: "#fafafa" } as React.CSSProperties,
+  card:  { background: "#fff", borderRadius: 10, padding: 20, boxShadow: "0 1px 3px rgba(0,0,0,.07)" } as React.CSSProperties,
+  empty: { textAlign: "center" as const, color: "#94a3b8", padding: "32px 0", fontSize: 14 },
+  h2:    { fontSize: 15, fontWeight: 700, color: "#0f172a", margin: "0 0 16px" } as React.CSSProperties,
 };
-const RC: Record<string, { icon: string; accent: string }> = {
-  "評価者": { icon: "◈", accent: "#1e3a8a" },
-  "PJMO":   { icon: "◇", accent: "#166534" },
-  "AI":     { icon: "◆", accent: "#6b21a8" },
-};
+const btn = (color = "#0f172a", disabled = false): React.CSSProperties => ({
+  background: disabled ? "#cbd5e1" : color, color: "#fff", border: "none",
+  borderRadius: 6, padding: "8px 18px", fontSize: 13, fontWeight: 700,
+  cursor: disabled ? "not-allowed" : "pointer", fontFamily: "'Noto Sans JP',sans-serif",
+});
+const chipBtn = (color = "#64748b"): React.CSSProperties => ({
+  fontSize: 11, padding: "4px 10px", cursor: "pointer", borderRadius: 20,
+  border: `1px solid #e2e8f0`, background: "transparent", color,
+  fontFamily: "'Noto Sans JP',sans-serif", whiteSpace: "nowrap" as const,
+});
+
+// ── ナビ定義 ─────────────────────────────────────────
 const NAV: { key: View; icon: string; label: string }[] = [
   { key: "dashboard", icon: "▦", label: "ダッシュボード" },
-  { key: "rally",     icon: "⇄", label: "レビューラリー" },
-  { key: "ai",        icon: "◈", label: "AI自動レビュー" },
+  { key: "systems",   icon: "⊞", label: "システム管理" },
+  { key: "rally",     icon: "⇄", label: "評価ラリー" },
+  { key: "advisor",   icon: "◉", label: "予算評価AI" },
   { key: "audit",     icon: "≡", label: "監査ログ" },
   { key: "webhook",   icon: "⬡", label: "通知履歴" },
 ];
 
-const S: Record<string, React.CSSProperties> = {
-  input: { padding: "7px 10px", border: "1px solid #e2e8f0", borderRadius: 6,
-           fontSize: 13, fontFamily: "'Noto Sans JP',sans-serif", background: "#fafafa" },
-};
+// ── Toastコンポーネント ───────────────────────────────
+function Toast({ msg }: { msg: string }) {
+  return (
+    <div style={{ position: "fixed", top: 20, right: 20, zIndex: 9999,
+                  background: "#0f172a", color: "#fff", padding: "10px 20px",
+                  borderRadius: 8, fontSize: 13, boxShadow: "0 4px 12px rgba(0,0,0,.3)" }}>
+      {msg}
+    </div>
+  );
+}
 
-function Badge({ s }: { s: Status }) {
-  const c = SC[s];
+// ── バッジ ─────────────────────────────────────────────
+function StatusBadge({ status }: { status: keyof typeof THREAD_STATUS }) {
+  const c = THREAD_STATUS[status];
   return (
     <span style={{ fontSize: 10, fontWeight: 700, color: c.color, background: c.bg,
                    border: `1px solid ${c.border}`, borderRadius: 4,
-                   padding: "1px 7px", fontFamily: "monospace", letterSpacing: 0.5 }}>{c.label}</span>
+                   padding: "1px 7px", fontFamily: "monospace" }}>{c.label}</span>
+  );
+}
+function TypeBadge({ type }: { type: keyof typeof ENTRY_TYPE }) {
+  const c = ENTRY_TYPE[type];
+  return (
+    <span style={{ fontSize: 10, fontWeight: 700, color: c.color, background: c.bg,
+                   borderRadius: 4, padding: "1px 7px", fontFamily: "monospace" }}>{c.label}</span>
   );
 }
 
-function KpiCard({ label, value, color, sub }: { label: string; value: number | string; color: string; sub?: string }) {
+// ── KPIカード ──────────────────────────────────────────
+function KpiCard({ label, value, color, sub }: { label: string; value: string | number; color: string; sub?: string }) {
   return (
-    <div style={{ background: "#fff", borderRadius: 10, padding: "18px 20px",
-                  boxShadow: "0 1px 3px rgba(0,0,0,0.07)",
-                  borderTop: `3px solid ${color}`, flex: 1, minWidth: 130 }}>
-      <div style={{ fontSize: 11, color: "#94a3b8", fontWeight: 700, letterSpacing: 0.5, marginBottom: 6 }}>{label}</div>
-      <div style={{ fontSize: 28, fontWeight: 800, color, fontFamily: "monospace", lineHeight: 1 }}>{value}</div>
-      {sub && <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 4 }}>{sub}</div>}
+    <div style={{ background: "#fff", borderRadius: 10, padding: "16px 18px",
+                  boxShadow: "0 1px 3px rgba(0,0,0,.07)", borderTop: `3px solid ${color}`,
+                  flex: 1, minWidth: 120 }}>
+      <div style={{ fontSize: 11, color: "#94a3b8", fontWeight: 700, marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 26, fontWeight: 800, color, fontFamily: "monospace" }}>{value}</div>
+      {sub && <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 3 }}>{sub}</div>}
     </div>
   );
 }
 
-function MiniBar({ label, count, total, color }: { label: string; count: number; total: number; color: string }) {
-  const pct = total > 0 ? Math.round(count / total * 100) : 0;
-  return (
-    <div style={{ marginBottom: 10 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 3 }}>
-        <span style={{ color: "#475569" }}>{label}</span>
-        <span style={{ fontFamily: "monospace", color, fontWeight: 700 }}>{count}件 ({pct}%)</span>
-      </div>
-      <div style={{ height: 6, background: "#f1f5f9", borderRadius: 3, overflow: "hidden" }}>
-        <div style={{ height: "100%", width: `${pct}%`, background: color, borderRadius: 3, transition: "width 0.6s ease" }} />
-      </div>
-    </div>
-  );
-}
-
-function LogEntry({ log, canConfirm, canNotify, onClose, onConfirm, onNotify }: {
-  log: ReviewLog; canConfirm: boolean; canNotify: boolean;
-  onClose(id: number): void; onConfirm(id: number): void; onNotify(id: number): void;
-}) {
-  const sc = SC[log.status] ?? SC.issue;
-  const rc = RC[log.role] ?? { icon: "○", accent: "#64748b" };
-  return (
-    <div style={{ borderLeft: `3px solid ${rc.accent}`, background: sc.bg,
-                  borderRadius: "0 8px 8px 0", padding: "13px 16px", marginBottom: 8,
-                  position: "relative", boxShadow: "0 1px 2px rgba(0,0,0,0.05)",
-                  opacity: log.status === "close" ? 0.6 : 1, transition: "opacity 0.2s" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 7, flexWrap: "wrap" }}>
-        <span style={{ color: rc.accent, fontSize: 16, fontFamily: "monospace" }}>{rc.icon}</span>
-        <span style={{ fontWeight: 700, color: rc.accent, fontSize: 13 }}>{log.role}</span>
-        <span style={{ fontSize: 12, color: "#94a3b8" }}>{log.author}</span>
-        <span style={{ fontFamily: "monospace", fontSize: 10, color: "#94a3b8",
-                       background: "#f1f5f9", border: "1px solid #e2e8f0",
-                       borderRadius: 3, padding: "1px 5px" }}>v{log.version}</span>
-        <div style={{ marginLeft: "auto", display: "flex", gap: 5, alignItems: "center" }}>
-          <Badge s={log.status} />
-          <span style={{ fontSize: 10, color: "#94a3b8", fontFamily: "monospace" }}>{log.created_at}</span>
-        </div>
-      </div>
-      <p style={{ margin: 0, fontSize: 13.5, lineHeight: 1.75, color: "#1e293b", whiteSpace: "pre-wrap" }}>{log.comment}</p>
-      {log.confirmed_by && (
-        <div style={{ marginTop: 7, fontSize: 11, color: "#64748b" }}>
-          ✓ {log.confirmed_by} が確定（{log.confirmed_at}）
-        </div>
-      )}
-      {log.status !== "close" && (
-        <div style={{ position: "absolute", top: 10, right: 10, display: "flex", gap: 4 }}>
-          {canNotify  && <Btn color="#0ea5e9" title="通知" onClick={() => onNotify(log.id)}>📡</Btn>}
-          {canConfirm && <Btn color="#16a34a" title="確定" onClick={() => onConfirm(log.id)}>✓</Btn>}
-          <Btn color="#94a3b8" title="クローズ" onClick={() => onClose(log.id)}>✕</Btn>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function Btn({ color, title, onClick, children }: React.PropsWithChildren<{ color: string; title?: string; onClick(): void }>) {
-  return (
-    <button onClick={onClick} title={title} style={{ background: "none", border: `1px solid ${color}`,
-      borderRadius: 4, cursor: "pointer", color, fontSize: 11, padding: "2px 6px", fontWeight: 700 }}>
-      {children}
-    </button>
-  );
-}
-
-function FormRow({ label, children, flex }: React.PropsWithChildren<{ label: string; flex?: number }>) {
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 3, flex }}>
-      <label style={{ fontSize: 10, color: "#94a3b8", fontWeight: 700, letterSpacing: 0.5 }}>{label}</label>
-      {children}
-    </div>
-  );
-}
-
-function Dashboard({ logs, onNav }: { logs: ReviewLog[]; onNav(v: View): void }) {
-  const total = logs.length;
-  const issue  = logs.filter(l => l.status === "issue").length;
-  const reply  = logs.filter(l => l.status === "reply").length;
-  const review = logs.filter(l => l.status === "review").length;
-  const closed = logs.filter(l => l.status === "close").length;
-  const open   = total - closed;
-  const closeRate = total > 0 ? Math.round(closed / total * 100) : 0;
-  const maxVer = logs.length > 0 ? Math.max(...logs.map(l => l.version)) : 0;
-  const recent = [...logs].reverse().slice(0, 5);
+// ── ダッシュボード ─────────────────────────────────────
+function Dashboard({ systems, onNav }: { systems: SystemRow[]; onNav: (v: View, id?: number) => void }) {
+  const totalThreads = systems.reduce((s, x) => s + x.thread_count, 0);
+  const totalOpen    = systems.reduce((s, x) => s + x.open_count, 0);
+  const totalClosed  = totalThreads - totalOpen;
+  const rate = totalThreads > 0 ? Math.round(totalClosed / totalThreads * 100) : 0;
 
   return (
     <div>
-      <h2 style={{ fontSize: 15, fontWeight: 700, color: "#0f172a", margin: "0 0 18px" }}>ダッシュボード</h2>
+      <h2 style={S.h2}>ダッシュボード</h2>
       <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
-        <KpiCard label="総スレッド"    value={total}        color="#475569" />
-        <KpiCard label="未解決指摘"    value={issue}        color="#ef4444" sub="対応が必要" />
-        <KpiCard label="オープン"      value={open}         color="#f59e0b" />
-        <KpiCard label="確定済み"      value={closed}       color="#22c55e" sub={`${closeRate}% 完了`} />
-        <KpiCard label="最新バージョン" value={`v${maxVer}`} color="#6366f1" />
+        <KpiCard label="評価対象システム" value={systems.length} color="#6366f1" />
+        <KpiCard label="スレッド合計" value={totalThreads} color="#475569" />
+        <KpiCard label="未解決" value={totalOpen} color="#ef4444" sub="対応が必要" />
+        <KpiCard label="確定済み" value={totalClosed} color="#22c55e" sub={`${rate}% 完了`} />
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
-        <div style={{ background: "#fff", borderRadius: 10, padding: "18px 20px", boxShadow: "0 1px 3px rgba(0,0,0,0.07)" }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: "#475569", marginBottom: 14 }}>種別分布</div>
-          <MiniBar label="指摘 (issue)"    count={issue}  total={total} color="#ef4444" />
-          <MiniBar label="回答 (reply)"    count={reply}  total={total} color="#22c55e" />
-          <MiniBar label="再評価 (review)" count={review} total={total} color="#f59e0b" />
-          <MiniBar label="確定 (close)"    count={closed} total={total} color="#94a3b8" />
+      <div style={S.card}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: "#475569", marginBottom: 14 }}>
+          評価対象システム一覧
         </div>
-        <div style={{ background: "#fff", borderRadius: 10, padding: "18px 20px", boxShadow: "0 1px 3px rgba(0,0,0,0.07)" }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: "#475569", marginBottom: 14 }}>処理状況</div>
-          <div style={{ display: "flex", alignItems: "center", gap: 24, justifyContent: "center", padding: "8px 0" }}>
-            <div style={{ position: "relative", width: 100, height: 100 }}>
-              <svg viewBox="0 0 36 36" style={{ transform: "rotate(-90deg)", width: 100, height: 100 }}>
-                <circle cx="18" cy="18" r="15.9" fill="none" stroke="#f1f5f9" strokeWidth="3.5" />
-                {total > 0 && (
-                  <circle cx="18" cy="18" r="15.9" fill="none" stroke="#22c55e" strokeWidth="3.5"
-                    strokeDasharray={`${closeRate} ${100 - closeRate}`} strokeLinecap="round" />
-                )}
-              </svg>
-              <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column",
-                            alignItems: "center", justifyContent: "center" }}>
-                <span style={{ fontSize: 20, fontWeight: 800, color: "#0f172a", fontFamily: "monospace" }}>{closeRate}%</span>
-                <span style={{ fontSize: 9, color: "#94a3b8" }}>完了率</span>
+        {systems.length === 0
+          ? <div style={S.empty}>システムが登録されていません</div>
+          : systems.map(s => (
+              <div key={s.id} onClick={() => onNav("rally", s.id)}
+                style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 0",
+                         borderBottom: "1px solid #f1f5f9", cursor: "pointer" }}
+                onMouseEnter={e => (e.currentTarget.style.background = "#f8fafc")}
+                onMouseLeave={e => (e.currentTarget.style.background = "")}>
+                <div style={{ width: 36, height: 36, borderRadius: 8, background: "#eef2ff",
+                              display: "flex", alignItems: "center", justifyContent: "center",
+                              fontSize: 16, flexShrink: 0 }}>⊞</div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 700, fontSize: 13 }}>{s.name}</div>
+                  <div style={{ fontSize: 11, color: "#94a3b8" }}>{s.department || "—"}</div>
+                </div>
+                <div style={{ display: "flex", gap: 8, fontSize: 11, color: "#64748b" }}>
+                  <span>事業 {s.project_count}件</span>
+                  <span>スレッド {s.thread_count}件</span>
+                  {s.open_count > 0 && (
+                    <span style={{ color: "#ef4444", fontWeight: 700 }}>未解決 {s.open_count}件</span>
+                  )}
+                </div>
               </div>
-            </div>
-            <div style={{ fontSize: 12 }}>
-              {([["確定済み", closed, "#22c55e"], ["未対応", open, "#f59e0b"]] as const).map(([l, v, c]) => (
-                <div key={l} style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 6 }}>
-                  <span style={{ width: 10, height: 10, borderRadius: "50%", background: c, display: "inline-block" }} />
-                  <span style={{ color: "#475569" }}>{l}</span>
-                  <span style={{ fontWeight: 700, color: c, fontFamily: "monospace", marginLeft: "auto" }}>{v}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
-      <div style={{ background: "#fff", borderRadius: 10, padding: "18px 20px", boxShadow: "0 1px 3px rgba(0,0,0,0.07)" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
-          <span style={{ fontSize: 12, fontWeight: 700, color: "#475569" }}>直近アクティビティ（5件）</span>
-          <button onClick={() => onNav("rally")} style={{ background: "none", border: "1px solid #e2e8f0",
-            borderRadius: 5, fontSize: 11, color: "#64748b", padding: "3px 10px", cursor: "pointer" }}>
-            すべて表示 →
-          </button>
-        </div>
-        {recent.length === 0
-          ? <div style={{ textAlign: "center", color: "#94a3b8", padding: 20, fontSize: 13 }}>データなし</div>
-          : recent.map(log => {
-              const rc2 = RC[log.role] ?? { icon: "○", accent: "#64748b" };
-              return (
-                <div key={log.id} style={{ display: "flex", alignItems: "flex-start", gap: 10,
-                                           padding: "9px 0", borderBottom: "1px solid #f8fafc" }}>
-                  <span style={{ color: rc2.accent, fontFamily: "monospace", fontSize: 15, marginTop: 1 }}>{rc2.icon}</span>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 2 }}>
-                      <span style={{ fontSize: 12, fontWeight: 700, color: rc2.accent }}>{log.role}</span>
-                      <span style={{ fontSize: 11, color: "#94a3b8" }}>{log.author}</span>
-                      <Badge s={log.status} />
-                      <span style={{ fontSize: 10, color: "#94a3b8", marginLeft: "auto", fontFamily: "monospace" }}>{log.created_at}</span>
-                    </div>
-                    <p style={{ margin: 0, fontSize: 12, color: "#475569", overflow: "hidden",
-                                textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{log.comment}</p>
-                  </div>
-                </div>
-              );
-            })}
+            ))
+        }
       </div>
     </div>
   );
 }
 
-export default function App() {
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [projectId, setProjectId] = useState(1);
-  const [logs, setLogs]   = useState<ReviewLog[]>([]);
-  const [audit, setAudit] = useState<AuditEntry[]>([]);
-  const [hooks, setHooks] = useState<WebhookLog[]>([]);
-  const [view, setView]   = useState<View>("dashboard");
-  const [comment, setComment] = useState("");
-  const [author, setAuthor]   = useState("山田主任");
-  const [role,   setRole]     = useState("PJMO");
-  const [status, setStatus]   = useState<Status>("reply");
-  const [aiText, setAiText]   = useState("");
-  const [loading, setLoading]     = useState(false);
-  const [aiLoading, setAiLoading] = useState(false);
-  const [currentRole, setCurrentRole] = useState<UserRole>("pjmo");
-  const [toast, setToast]   = useState<string | null>(null);
-  const [sideOpen, setSideOpen] = useState(true);
+// ── システム管理 ────────────────────────────────────────
+function SystemsView({ headers, showToast }: { headers: () => Record<string, string>; showToast: (m: string) => void }) {
+  const [systems, setSystems] = useState<SystemRow[]>([]);
+  const [projects, setProjects] = useState<Record<number, ProjectRow[]>>({});
+  const [expandedSys, setExpandedSys] = useState<number | null>(null);
+  const [showNewSys, setShowNewSys] = useState(false);
+  const [showNewPj, setShowNewPj] = useState<number | null>(null);
+  const [newSysName, setNewSysName] = useState("");
+  const [newSysDept, setNewSysDept] = useState("");
+  const [newPj, setNewPj] = useState({ name: "", cost_category: "", amount_single: "", amount_advance: "", amount_deferred: "", evaluator_name: "" });
 
-  const canConfirm = currentRole === "admin" || currentRole === "evaluator";
-  const canExport  = currentRole === "admin" || currentRole === "evaluator";
-  const canNotify  = currentRole === "admin" || currentRole === "pjmo";
-
-  const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 3000); };
-  const headers = () => ({ "X-User-Name": author, "X-User-Role": currentRole });
-
-  const loadProjects = useCallback(() => {
-    fetch(`${API}/projects/`).then(r => r.json()).then(setProjects).catch(console.error);
+  const loadSystems = useCallback(() => {
+    fetch(`${API}/systems/`, { headers: headers() }).then(r => r.json()).then(setSystems);
   }, []);
-  const loadLogs = useCallback(() => {
-    fetch(`${API}/review/${projectId}`, { headers: headers() })
-      .then(r => r.json()).then(setLogs).catch(console.error);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, currentRole]);
-  const loadAudit = useCallback(() => {
-    fetch(`${API}/review/${projectId}/audit`, { headers: headers() })
-      .then(r => r.json()).then(setAudit).catch(console.error);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, currentRole]);
-  const loadHooks = useCallback(() => {
-    fetch(`${API}/notify/logs/${projectId}`, { headers: headers() })
-      .then(r => r.json()).then(setHooks).catch(console.error);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, currentRole]);
 
-  useEffect(() => { loadProjects(); }, [loadProjects]);
-  useEffect(() => { loadLogs(); }, [loadLogs]);
-  useEffect(() => { if (view === "audit")   loadAudit(); }, [view, loadAudit]);
-  useEffect(() => { if (view === "webhook") loadHooks(); }, [view, loadHooks]);
-
-  const sendComment = () => {
-    if (!comment.trim()) return;
-    setLoading(true);
-    fetch(`${API}/review/`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...headers() },
-      body: JSON.stringify({ project_id: projectId, author, role, comment, status }),
-    }).then(() => { setComment(""); loadLogs(); showToast("送信しました"); })
-      .finally(() => setLoading(false));
-  };
-  const closeLog = (id: number) => {
-    fetch(`${API}/review/${id}`, { method: "DELETE", headers: headers() })
-      .then(() => { loadLogs(); showToast("クローズしました"); });
-  };
-  const confirmLog = (id: number) => {
-    fetch(`${API}/review/${id}/confirm`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...headers() },
-      body: JSON.stringify({ confirmed_by: author }),
-    }).then(() => { loadLogs(); showToast("評価を確定しました"); });
-  };
-  const notifyLog = (id: number) => {
-    fetch(`${API}/notify/review/${id}`, {
-      method: "POST", headers: { "Content-Type": "application/json", ...headers() },
-    }).then(() => showToast("通知を送信しました（Agent Card形式）"));
-  };
-  const sendAi = () => {
-    if (!aiText.trim()) return;
-    setAiLoading(true);
-    fetch(`${API}/review/auto`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...headers() },
-      body: JSON.stringify({ project_id: projectId, text: aiText }),
-    })
-      .then(r => r.json())
-      .then(() => { setAiText(""); setView("rally"); loadLogs(); showToast("AIレビューを登録しました"); })
-      .catch(e => alert("AI APIエラー: " + e.message))
-      .finally(() => setAiLoading(false));
-  };
-  const exportFile = (type: "excel" | "pdf") => {
-    fetch(`${API}/export/${projectId}/${type}`, { headers: headers() })
-      .then(r => { if (!r.ok) throw new Error("エクスポートエラー"); return r.blob(); })
-      .then(blob => {
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `review_pj${projectId}.${type === "excel" ? "xlsx" : "pdf"}`;
-        a.click();
-        URL.revokeObjectURL(url);
-        showToast(`${type.toUpperCase()} をダウンロードしました`);
-      }).catch(e => alert(e.message));
+  const loadProjects = (sysId: number) => {
+    fetch(`${API}/systems/${sysId}/projects`, { headers: headers() })
+      .then(r => r.json()).then(data => setProjects(p => ({ ...p, [sysId]: data })));
   };
 
-  const issueCount = logs.filter(l => l.status === "issue").length;
-  const currentProject = projects.find(p => p.id === projectId);
+  useEffect(() => { loadSystems(); }, [loadSystems]);
+
+  const createSystem = () => {
+    if (!newSysName.trim()) return;
+    fetch(`${API}/systems/`, { method: "POST",
+      headers: { "Content-Type": "application/json", ...headers() },
+      body: JSON.stringify({ name: newSysName, department: newSysDept })
+    }).then(() => { setNewSysName(""); setNewSysDept(""); setShowNewSys(false); loadSystems(); showToast("システムを追加しました"); });
+  };
+
+  const createProject = (sysId: number) => {
+    if (!newPj.name.trim()) return;
+    fetch(`${API}/projects/`, { method: "POST",
+      headers: { "Content-Type": "application/json", ...headers() },
+      body: JSON.stringify({ system_id: sysId, name: newPj.name,
+        cost_category: newPj.cost_category || null,
+        amount_single: Number(newPj.amount_single) || 0,
+        amount_advance: Number(newPj.amount_advance) || 0,
+        amount_deferred: Number(newPj.amount_deferred) || 0,
+        evaluator_name: newPj.evaluator_name || null })
+    }).then(() => {
+      setNewPj({ name: "", cost_category: "", amount_single: "", amount_advance: "", amount_deferred: "", evaluator_name: "" });
+      setShowNewPj(null); loadProjects(sysId); loadSystems(); showToast("事業を追加しました");
+    });
+  };
+
+  const fmtAmount = (n: number) => n > 0 ? `${n.toLocaleString()} 千円` : "—";
 
   return (
-    <div style={{ display: "flex", minHeight: "100vh", background: "#f1f5f9", fontFamily: "'Noto Sans JP',sans-serif" }}>
-      {toast && (
-        <div style={{ position: "fixed", top: 20, right: 20, zIndex: 9999, background: "#0f172a", color: "#fff",
-                      padding: "10px 20px", borderRadius: 8, fontSize: 13, boxShadow: "0 4px 12px rgba(0,0,0,0.3)" }}>
-          {toast}
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+        <h2 style={{ ...S.h2, margin: 0 }}>システム管理</h2>
+        <button onClick={() => setShowNewSys(true)} style={btn("#4338ca")}>＋ システム追加</button>
+      </div>
+
+      {/* 新規システムモーダル */}
+      {showNewSys && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.4)", zIndex: 1000,
+                      display: "flex", alignItems: "center", justifyContent: "center" }}
+             onClick={() => setShowNewSys(false)}>
+          <div style={{ ...S.card, width: 400 }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ margin: "0 0 16px", fontSize: 15 }}>評価対象システムを追加</h3>
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 4 }}>システム名 *</label>
+              <input value={newSysName} onChange={e => setNewSysName(e.target.value)}
+                placeholder="例：人事給与システム（次期）"
+                style={{ ...S.input, width: "100%", boxSizing: "border-box" as const }} />
+            </div>
+            <div style={{ marginBottom: 20 }}>
+              <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 4 }}>担当部署</label>
+              <input value={newSysDept} onChange={e => setNewSysDept(e.target.value)}
+                placeholder="例：人事院"
+                style={{ ...S.input, width: "100%", boxSizing: "border-box" as const }} />
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button onClick={() => setShowNewSys(false)} style={chipBtn()}>キャンセル</button>
+              <button onClick={createSystem} disabled={!newSysName.trim()} style={btn("#0f172a", !newSysName.trim())}>追加</button>
+            </div>
+          </div>
         </div>
       )}
-      <aside style={{ width: sideOpen ? 200 : 52, transition: "width 0.25s ease", background: "#0f172a",
+
+      {systems.length === 0
+        ? <div style={{ ...S.card, ...S.empty }}>システムが登録されていません</div>
+        : systems.map(s => (
+          <div key={s.id} style={{ ...S.card, marginBottom: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 700, fontSize: 14 }}>{s.name}</div>
+                <div style={{ fontSize: 12, color: "#64748b" }}>{s.department || "担当部署未設定"}</div>
+              </div>
+              <div style={{ fontSize: 11, color: "#64748b", display: "flex", gap: 10 }}>
+                <span>事業 {s.project_count}件</span>
+                <span>スレッド {s.thread_count}件</span>
+                {s.open_count > 0 && <span style={{ color: "#ef4444", fontWeight: 700 }}>未解決 {s.open_count}件</span>}
+              </div>
+              <button onClick={() => {
+                if (expandedSys === s.id) { setExpandedSys(null); }
+                else { setExpandedSys(s.id); loadProjects(s.id); }
+              }} style={chipBtn()}>
+                {expandedSys === s.id ? "▲ 閉じる" : "▼ 事業一覧"}
+              </button>
+            </div>
+
+            {expandedSys === s.id && (
+              <div style={{ marginTop: 14, borderTop: "1px solid #f1f5f9", paddingTop: 14 }}>
+                {(projects[s.id] || []).map(p => (
+                  <div key={p.id} style={{ padding: "10px 0", borderBottom: "1px solid #f8fafc" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <div style={{ flex: 1 }}>
+                        <span style={{ fontWeight: p.is_system_wide ? 400 : 700, fontSize: 13,
+                                       color: p.is_system_wide ? "#94a3b8" : "#0f172a" }}>
+                          {p.is_system_wide ? "📌 システム全体" : p.name}
+                        </span>
+                        {!p.is_system_wide && p.cost_category && (
+                          <span style={{ fontSize: 10, marginLeft: 8, padding: "1px 7px", borderRadius: 4,
+                                         background: "#f1f5f9", color: "#475569" }}>{p.cost_category}</span>
+                        )}
+                      </div>
+                      {!p.is_system_wide && (
+                        <div style={{ fontSize: 11, color: "#64748b", display: "flex", gap: 10 }}>
+                          <span>単歳 {fmtAmount(p.amount_single)}</span>
+                          {p.amount_deferred > 0 && <span>後年 {fmtAmount(p.amount_deferred)}</span>}
+                          {p.evaluator_name && <span>評価者: {p.evaluator_name}</span>}
+                        </div>
+                      )}
+                      <span style={{ fontSize: 11, color: p.open_count > 0 ? "#ef4444" : "#22c55e" }}>
+                        {p.thread_count}件 {p.open_count > 0 ? `(未解決${p.open_count})` : "(完了)"}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+                <div style={{ marginTop: 12 }}>
+                  {showNewPj === s.id ? (
+                    <div style={{ background: "#f8fafc", borderRadius: 8, padding: 14 }}>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+                        <div>
+                          <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>事業名 *</label>
+                          <input value={newPj.name} onChange={e => setNewPj(p => ({ ...p, name: e.target.value }))}
+                            style={{ ...S.input, width: "100%", boxSizing: "border-box" as const }} />
+                        </div>
+                        <div>
+                          <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>経費区分</label>
+                          <select value={newPj.cost_category} onChange={e => setNewPj(p => ({ ...p, cost_category: e.target.value }))}
+                            style={{ ...S.input, width: "100%" }}>
+                            <option value="">選択してください</option>
+                            {COST_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+                          </select>
+                        </div>
+                        <div>
+                          <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>単歳要求額（千円）</label>
+                          <input type="number" value={newPj.amount_single}
+                            onChange={e => setNewPj(p => ({ ...p, amount_single: e.target.value }))}
+                            style={{ ...S.input, width: "100%", boxSizing: "border-box" as const }} />
+                        </div>
+                        <div>
+                          <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>後年度負担金（千円）</label>
+                          <input type="number" value={newPj.amount_deferred}
+                            onChange={e => setNewPj(p => ({ ...p, amount_deferred: e.target.value }))}
+                            style={{ ...S.input, width: "100%", boxSizing: "border-box" as const }} />
+                        </div>
+                        <div>
+                          <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>評価者名</label>
+                          <input value={newPj.evaluator_name}
+                            onChange={e => setNewPj(p => ({ ...p, evaluator_name: e.target.value }))}
+                            placeholder="例：田中係長"
+                            style={{ ...S.input, width: "100%", boxSizing: "border-box" as const }} />
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                        <button onClick={() => setShowNewPj(null)} style={chipBtn()}>キャンセル</button>
+                        <button onClick={() => createProject(s.id)} disabled={!newPj.name.trim()}
+                          style={btn("#0f172a", !newPj.name.trim())}>追加</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <button onClick={() => setShowNewPj(s.id)} style={chipBtn("#4338ca")}>＋ 事業追加</button>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        ))
+      }
+    </div>
+  );
+}
+
+// ── 評価ラリー ─────────────────────────────────────────
+function RallyView({ initialSystemId, headers, showToast, currentRole }:
+  { initialSystemId?: number; headers: () => Record<string, string>;
+    showToast: (m: string) => void; currentRole: UserRole }) {
+
+  const [systems, setSystems]   = useState<SystemRow[]>([]);
+  const [projects, setProjects] = useState<ProjectRow[]>([]);
+  const [threads, setThreads]   = useState<ThreadRow[]>([]);
+  const [entries, setEntries]   = useState<EntryRow[]>([]);
+  const [selSys, setSelSys]     = useState<number | null>(initialSystemId || null);
+  const [selPj, setSelPj]       = useState<number | null>(null);
+  const [selThread, setSelThread] = useState<number | null>(null);
+
+  const [showNewThread, setShowNewThread] = useState(false);
+  const [newThread, setNewThread] = useState({ title: "", comment: "", due_date: "", entry_date: "" });
+  const [newEntry, setNewEntry]   = useState({ entry_type: "reply" as "reply"|"review"|"close", comment: "", entry_date: "" });
+  const [aiText, setAiText]       = useState("");
+  const [loading, setLoading]     = useState(false);
+
+  const canEvaluator = currentRole === "admin" || currentRole === "evaluator";
+  const canPjmo      = currentRole === "admin" || currentRole === "pjmo";
+
+  useEffect(() => {
+    fetch(`${API}/systems/`, { headers: headers() }).then(r => r.json()).then(data => {
+      setSystems(data);
+      if (initialSystemId) setSelSys(initialSystemId);
+      else if (data.length > 0) setSelSys(data[0].id);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!selSys) return;
+    fetch(`${API}/systems/${selSys}/projects`, { headers: headers() }).then(r => r.json()).then(data => {
+      setProjects(data);
+      setSelPj(data[0]?.id || null);
+    });
+  }, [selSys]);
+
+  useEffect(() => {
+    if (!selPj) return;
+    fetch(`${API}/threads/${selPj}`, { headers: headers() }).then(r => r.json()).then(setThreads);
+    setSelThread(null); setEntries([]);
+  }, [selPj]);
+
+  useEffect(() => {
+    if (!selThread) return;
+    fetch(`${API}/threads/${selThread}/entries`, { headers: headers() }).then(r => r.json()).then(setEntries);
+  }, [selThread]);
+
+  const reloadThreads = () => {
+    if (!selPj) return;
+    fetch(`${API}/threads/${selPj}`, { headers: headers() }).then(r => r.json()).then(setThreads);
+  };
+  const reloadEntries = () => {
+    if (!selThread) return;
+    fetch(`${API}/threads/${selThread}/entries`, { headers: headers() }).then(r => r.json()).then(setEntries);
+  };
+
+  const createThread = () => {
+    if (!newThread.comment.trim() || !selPj) return;
+    setLoading(true);
+    fetch(`${API}/threads/`, { method: "POST",
+      headers: { "Content-Type": "application/json", ...headers() },
+      body: JSON.stringify({ project_id: selPj, ...newThread })
+    }).then(() => {
+      setNewThread({ title: "", comment: "", due_date: "", entry_date: "" });
+      setShowNewThread(false); reloadThreads(); showToast("指摘を追加しました");
+    }).finally(() => setLoading(false));
+  };
+
+  const addEntry = () => {
+    if (!newEntry.comment.trim() || !selThread) return;
+    setLoading(true);
+    fetch(`${API}/threads/${selThread}/entries`, { method: "POST",
+      headers: { "Content-Type": "application/json", ...headers() },
+      body: JSON.stringify(newEntry)
+    }).then(() => {
+      setNewEntry({ entry_type: "reply", comment: "", entry_date: "" });
+      reloadEntries(); reloadThreads(); showToast("投稿しました");
+    }).finally(() => setLoading(false));
+  };
+
+  const runAI = () => {
+    if (!aiText.trim() || !selPj) return;
+    setLoading(true);
+    fetch(`${API}/threads/auto`, { method: "POST",
+      headers: { "Content-Type": "application/json", ...headers() },
+      body: JSON.stringify({ project_id: selPj, content: aiText })
+    }).then(() => {
+      setAiText(""); reloadThreads(); showToast("AI指摘を追加しました");
+    }).catch(e => alert("エラー: " + e.message))
+    .finally(() => setLoading(false));
+  };
+
+  const curThread = threads.find(t => t.id === selThread);
+
+  return (
+    <div style={{ display: "flex", height: "calc(100vh - 94px)", gap: 0 }}>
+      {/* 左ペイン: システム/事業選択 */}
+      <div style={{ width: 220, flexShrink: 0, borderRight: "1px solid #e2e8f0",
+                    overflowY: "auto", background: "#f8fafc" }}>
+        <div style={{ padding: "10px 12px", borderBottom: "1px solid #e2e8f0" }}>
+          <select value={selSys || ""} onChange={e => setSelSys(Number(e.target.value))}
+            style={{ ...S.input, width: "100%", fontSize: 12 }}>
+            {systems.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </div>
+        <div style={{ padding: "8px 0" }}>
+          {projects.map(p => (
+            <div key={p.id} onClick={() => setSelPj(p.id)}
+              style={{ padding: "9px 14px", cursor: "pointer", fontSize: 12,
+                       background: selPj === p.id ? "#e0e7ff" : "transparent",
+                       borderLeft: selPj === p.id ? "3px solid #4338ca" : "3px solid transparent",
+                       color: p.is_system_wide ? "#94a3b8" : "#1e293b" }}>
+              <div style={{ fontWeight: selPj === p.id ? 700 : 400 }}>
+                {p.is_system_wide ? "📌 システム全体" : p.name}
+              </div>
+              {!p.is_system_wide && (
+                <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 2 }}>
+                  {p.cost_category || "経費区分未設定"}
+                  {p.open_count > 0 && <span style={{ color: "#ef4444", marginLeft: 6 }}>未解決{p.open_count}</span>}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* 中央ペイン: スレッド一覧 */}
+      <div style={{ width: 280, flexShrink: 0, borderRight: "1px solid #e2e8f0",
+                    overflowY: "auto", background: "#fff" }}>
+        <div style={{ padding: "10px 12px", borderBottom: "1px solid #e2e8f0",
+                      display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: "#475569" }}>指摘スレッド</span>
+          <div style={{ display: "flex", gap: 4 }}>
+            {canEvaluator && (
+              <button onClick={() => setShowNewThread(true)} style={chipBtn("#4338ca")}>＋ 指摘</button>
+            )}
+          </div>
+        </div>
+
+        {threads.length === 0
+          ? <div style={{ ...S.empty, fontSize: 12 }}>指摘がありません</div>
+          : threads.map(t => (
+              <div key={t.id} onClick={() => setSelThread(t.id)}
+                style={{ padding: "10px 12px", cursor: "pointer", borderBottom: "1px solid #f8fafc",
+                         background: selThread === t.id ? "#f0f4ff" : "transparent" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                  <span style={{ fontSize: 11, color: "#94a3b8", fontFamily: "monospace" }}>#{t.thread_no}</span>
+                  <StatusBadge status={t.status} />
+                </div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: "#1e293b", marginBottom: 4 }}>
+                  {t.title || `指摘 #${t.thread_no}`}
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#94a3b8" }}>
+                  <span>{t.entry_count}件の投稿</span>
+                  {t.due_date && <span style={{ color: "#f59e0b" }}>期限: {t.due_date}</span>}
+                </div>
+              </div>
+            ))
+        }
+
+        {/* AI指摘生成 */}
+        {canEvaluator && selPj && (
+          <div style={{ padding: "10px 12px", borderTop: "1px solid #e2e8f0" }}>
+            <div style={{ fontSize: 11, color: "#6b21a8", fontWeight: 700, marginBottom: 6 }}>🤖 AI自動指摘</div>
+            <textarea value={aiText} onChange={e => setAiText(e.target.value)}
+              placeholder="仕様書・見積書を貼り付け..."
+              rows={3}
+              style={{ ...S.input, width: "100%", resize: "vertical", boxSizing: "border-box" as const, fontSize: 11 }} />
+            <button onClick={runAI} disabled={loading || !aiText.trim()}
+              style={{ ...btn("#6b21a8", loading || !aiText.trim()), marginTop: 6, width: "100%", fontSize: 11 }}>
+              {loading ? "生成中..." : "AI指摘を生成"}
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* 右ペイン: スレッド詳細 */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflowY: "auto" }}>
+        {!selThread ? (
+          <div style={{ ...S.empty, marginTop: 60 }}>スレッドを選択してください</div>
+        ) : (
+          <>
+            {/* スレッドヘッダー */}
+            <div style={{ padding: "12px 16px", borderBottom: "1px solid #e2e8f0", background: "#fff" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontFamily: "monospace", fontSize: 12, color: "#94a3b8" }}>#{curThread?.thread_no}</span>
+                <span style={{ fontWeight: 700, fontSize: 14 }}>{curThread?.title || "（タイトルなし）"}</span>
+                {curThread && <StatusBadge status={curThread.status} />}
+              </div>
+              {curThread?.due_date && (
+                <div style={{ fontSize: 11, color: "#f59e0b", marginTop: 4 }}>期限: {curThread.due_date}</div>
+              )}
+            </div>
+
+            {/* 投稿一覧 */}
+            <div style={{ flex: 1, overflowY: "auto", padding: "12px 16px" }}>
+              {entries.map(e => {
+                const rc = ROLE_ICON[e.role];
+                const tc = ENTRY_TYPE[e.entry_type];
+                return (
+                  <div key={e.id} style={{ borderLeft: `3px solid ${rc.color}`, background: tc.bg,
+                                           borderRadius: "0 8px 8px 0", padding: "12px 14px",
+                                           marginBottom: 10 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" as const }}>
+                      <span style={{ color: rc.color, fontSize: 14, fontFamily: "monospace" }}>{rc.icon}</span>
+                      <span style={{ fontWeight: 700, color: rc.color, fontSize: 12 }}>{rc.label}</span>
+                      <span style={{ fontFamily: "monospace", fontSize: 10, color: "#94a3b8",
+                                     background: "#f1f5f9", borderRadius: 3, padding: "1px 5px" }}>seq.{e.seq}</span>
+                      <div style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
+                        <TypeBadge type={e.entry_type} />
+                        <span style={{ fontSize: 10, color: "#94a3b8", fontFamily: "monospace" }}>
+                          {e.entry_date || e.created_at}
+                        </span>
+                      </div>
+                    </div>
+                    <p style={{ margin: 0, fontSize: 13, lineHeight: 1.75, whiteSpace: "pre-wrap" }}>{e.comment}</p>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* 新規投稿フォーム */}
+            {curThread?.status !== "closed" && (
+              <div style={{ padding: "12px 16px", borderTop: "1px solid #e2e8f0", background: "#fff" }}>
+                <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                  <select value={newEntry.entry_type}
+                    onChange={e => setNewEntry(n => ({ ...n, entry_type: e.target.value as any }))}
+                    style={{ ...S.input }}>
+                    {canPjmo && <option value="reply">回答（PJMO）</option>}
+                    {canEvaluator && <option value="review">再評価（評価者）</option>}
+                    {canEvaluator && <option value="close">確定（評価者）</option>}
+                  </select>
+                  <input type="date" value={newEntry.entry_date}
+                    onChange={e => setNewEntry(n => ({ ...n, entry_date: e.target.value }))}
+                    style={{ ...S.input }} />
+                </div>
+                <textarea value={newEntry.comment}
+                  onChange={e => setNewEntry(n => ({ ...n, comment: e.target.value }))}
+                  placeholder="コメントを入力..." rows={3}
+                  style={{ ...S.input, width: "100%", resize: "vertical", boxSizing: "border-box" as const, marginBottom: 8 }} />
+                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                  <button onClick={addEntry} disabled={loading || !newEntry.comment.trim()}
+                    style={btn("#0f172a", loading || !newEntry.comment.trim())}>
+                    {loading ? "送信中..." : "投稿"}
+                  </button>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* 新規スレッドモーダル */}
+      {showNewThread && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.4)", zIndex: 1000,
+                      display: "flex", alignItems: "center", justifyContent: "center" }}
+             onClick={() => setShowNewThread(false)}>
+          <div style={{ ...S.card, width: 480 }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ margin: "0 0 16px", fontSize: 15 }}>指摘を追加</h3>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+              <div style={{ gridColumn: "1/-1" }}>
+                <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>タイトル（任意）</label>
+                <input value={newThread.title} onChange={e => setNewThread(n => ({ ...n, title: e.target.value }))}
+                  placeholder="例：積算根拠の確認"
+                  style={{ ...S.input, width: "100%", boxSizing: "border-box" as const }} />
+              </div>
+              <div>
+                <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>期限日</label>
+                <input type="date" value={newThread.due_date}
+                  onChange={e => setNewThread(n => ({ ...n, due_date: e.target.value }))}
+                  style={{ ...S.input, width: "100%" }} />
+              </div>
+              <div>
+                <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>指摘日</label>
+                <input type="date" value={newThread.entry_date}
+                  onChange={e => setNewThread(n => ({ ...n, entry_date: e.target.value }))}
+                  style={{ ...S.input, width: "100%" }} />
+              </div>
+            </div>
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 3 }}>指摘内容 *</label>
+              <textarea value={newThread.comment} onChange={e => setNewThread(n => ({ ...n, comment: e.target.value }))}
+                placeholder="DS-110第○条に基づき..." rows={5}
+                style={{ ...S.input, width: "100%", resize: "vertical", boxSizing: "border-box" as const }} />
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button onClick={() => setShowNewThread(false)} style={chipBtn()}>キャンセル</button>
+              <button onClick={createThread} disabled={loading || !newThread.comment.trim()}
+                style={btn("#9b1c1c", loading || !newThread.comment.trim())}>指摘を追加</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── メインApp ──────────────────────────────────────────
+export default function App() {
+  const [view, setView]           = useState<View>("dashboard");
+  const [systems, setSystems]     = useState<SystemRow[]>([]);
+  const [currentRole, setCurrentRole] = useState<UserRole>("pjmo");
+  const [toast, setToast]         = useState<string | null>(null);
+  const [sideOpen, setSideOpen]   = useState(true);
+  const [rallySystemId, setRallySystemId] = useState<number | undefined>(undefined);
+  const [auditData, setAuditData] = useState<AuditRow[]>([]);
+  const [hookData, setHookData]   = useState<WebhookRow[]>([]);
+
+  const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 3000); };
+  const headers = () => ({
+    "X-User-Name": btoa(encodeURIComponent("ユーザー")),
+    "X-User-Role": currentRole,
+  });
+
+  const loadSystems = useCallback(() => {
+    fetch(`${API}/systems/`, { headers: headers() }).then(r => r.json()).then(setSystems);
+  }, [currentRole]);
+
+  useEffect(() => { loadSystems(); }, [loadSystems]);
+  useEffect(() => {
+    if (view === "audit")
+      fetch(`${API}/systems/`, { headers: headers() }).then(r => r.json())
+        .then(sysList => {
+          if (sysList.length > 0)
+            fetch(`${API}/threads/1`, { headers: headers() }).catch(() => {});
+        });
+  }, [view]);
+
+  const navTo = (v: View, sysId?: number) => {
+    if (v === "rally" && sysId) setRallySystemId(sysId);
+    setView(v);
+  };
+
+  return (
+    <div style={{ display: "flex", minHeight: "100vh", background: "#f1f5f9",
+                  fontFamily: "'Noto Sans JP',sans-serif" }}>
+      {toast && <Toast msg={toast} />}
+
+      {/* サイドバー */}
+      <aside style={{ width: sideOpen ? 200 : 52, transition: "width .25s", background: "#0f172a",
                       display: "flex", flexDirection: "column", flexShrink: 0, overflow: "hidden" }}>
         <div style={{ height: 54, display: "flex", alignItems: "center",
-                      padding: sideOpen ? "0 16px" : "0 14px", gap: 10, borderBottom: "1px solid #1e293b" }}>
-          <span style={{ fontFamily: "monospace", fontSize: 13, color: "#60a5fa", fontWeight: 700, letterSpacing: 2, flexShrink: 0 }}>▦</span>
-          {sideOpen && <span style={{ fontSize: 12, fontWeight: 700, color: "#e2e8f0", whiteSpace: "nowrap" }}>PJMO Review</span>}
+                      padding: sideOpen ? "0 16px" : "0 14px", gap: 10,
+                      borderBottom: "1px solid #1e293b" }}>
+          <span style={{ fontFamily: "monospace", fontSize: 13, color: "#60a5fa",
+                         fontWeight: 700, letterSpacing: 2, flexShrink: 0 }}>▦</span>
+          {sideOpen && <span style={{ fontSize: 11, fontWeight: 700, color: "#e2e8f0", whiteSpace: "nowrap" }}>
+            予算額妥当性評価
+          </span>}
           <button onClick={() => setSideOpen(v => !v)}
-            style={{ marginLeft: "auto", background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 16, padding: 0, flexShrink: 0 }}>
+            style={{ marginLeft: "auto", background: "none", border: "none",
+                     color: "#475569", cursor: "pointer", fontSize: 16, padding: 0, flexShrink: 0 }}>
             {sideOpen ? "◀" : "▶"}
           </button>
         </div>
         <nav style={{ padding: "12px 0", flex: 1 }}>
           {NAV.map(n => (
-            <button key={n.key} onClick={() => setView(n.key)}
+            <button key={n.key} onClick={() => navTo(n.key)}
               style={{ display: "flex", alignItems: "center", gap: 10, width: "100%",
                        padding: sideOpen ? "9px 16px" : "9px 14px",
-                       background: view === n.key ? "#1e293b" : "none", border: "none", cursor: "pointer",
+                       background: view === n.key ? "#1e293b" : "none", border: "none",
+                       cursor: "pointer",
                        borderLeft: view === n.key ? "3px solid #60a5fa" : "3px solid transparent",
                        color: view === n.key ? "#e2e8f0" : "#64748b",
                        fontSize: 13, fontFamily: "'Noto Sans JP',sans-serif",
-                       transition: "all 0.15s", textAlign: "left" }}>
+                       transition: "all .15s", textAlign: "left" as const }}>
               <span style={{ fontFamily: "monospace", fontSize: 14, flexShrink: 0 }}>{n.icon}</span>
               {sideOpen && <span style={{ whiteSpace: "nowrap", fontSize: 12 }}>{n.label}</span>}
             </button>
@@ -380,146 +702,46 @@ export default function App() {
           </div>
         )}
       </aside>
+
+      {/* メインコンテンツ */}
       <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
         <header style={{ height: 54, background: "#fff", borderBottom: "1px solid #e2e8f0",
-                         display: "flex", alignItems: "center", padding: "0 20px", gap: 14,
-                         boxShadow: "0 1px 2px rgba(0,0,0,0.04)" }}>
-          <select value={projectId} onChange={e => setProjectId(Number(e.target.value))}
-            style={{ ...S.input, minWidth: 240, fontSize: 13 }}>
-            {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-          </select>
-          {currentProject && <span style={{ fontSize: 11, color: "#94a3b8" }}>{currentProject.description}</span>}
-          <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
-            {issueCount > 0 && (
-              <span style={{ background: "#dc2626", color: "#fff", borderRadius: 12,
-                             padding: "2px 10px", fontSize: 11, fontWeight: 700 }}>
-                ⚠ 未解決指摘 {issueCount}件
-              </span>
-            )}
-            {canExport && (<>
-              <button onClick={() => exportFile("excel")} style={exportBtn("#16a34a")}>↓ Excel</button>
-              <button onClick={() => exportFile("pdf")}   style={exportBtn("#dc2626")}>↓ PDF</button>
-            </>)}
-          </div>
+                         display: "flex", alignItems: "center", padding: "0 20px",
+                         boxShadow: "0 1px 2px rgba(0,0,0,.04)" }}>
+          <span style={{ fontWeight: 700, fontSize: 14, color: "#0f172a" }}>
+            {NAV.find(n => n.key === view)?.label}
+          </span>
         </header>
-        <main style={{ flex: 1, overflowY: "auto", padding: 24 }}>
-          {view === "dashboard" && <Dashboard logs={logs} onNav={setView} />}
-          {view === "rally" && (
-            <div>
-              <h2 style={h2}>レビューラリー</h2>
-              <div style={card}>
-                {logs.length === 0
-                  ? <div style={empty}>レビュー履歴がありません</div>
-                  : logs.map(log => (
-                      <LogEntry key={log.id} log={log}
-                        canConfirm={canConfirm} canNotify={canNotify}
-                        onClose={closeLog} onConfirm={confirmLog} onNotify={notifyLog} />
-                    ))}
-                <div style={{ borderTop: "1px solid #f1f5f9", paddingTop: 18, marginTop: 8 }}>
-                  <div style={{ display: "flex", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
-                    <FormRow label="氏名" flex={1}><input value={author} onChange={e => setAuthor(e.target.value)} style={{ ...S.input, minWidth: 100 }} /></FormRow>
-                    <FormRow label="役割"><select value={role} onChange={e => setRole(e.target.value)} style={S.input}><option value="PJMO">PJMO</option><option value="評価者">評価者</option></select></FormRow>
-                    <FormRow label="種別"><select value={status} onChange={e => setStatus(e.target.value as Status)} style={S.input}><option value="issue">指摘</option><option value="reply">回答</option><option value="review">再評価</option><option value="close">確定</option></select></FormRow>
-                  </div>
-                  <textarea value={comment} onChange={e => setComment(e.target.value)}
-                    placeholder="コメントを入力..." rows={4}
-                    style={{ ...S.input, width: "100%", resize: "vertical", lineHeight: 1.6, boxSizing: "border-box", marginBottom: 10 }} />
-                  <div style={{ display: "flex", justifyContent: "flex-end" }}>
-                    <button onClick={sendComment} disabled={loading || !comment.trim()} style={primaryBtn(loading || !comment.trim())}>
-                      {loading ? "送信中..." : "送信"}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
+
+        <main style={{ flex: 1, overflow: view === "rally" || view === "advisor" ? "hidden" : "auto",
+                       padding: view === "rally" || view === "advisor" ? 0 : 24 }}>
+          {view === "dashboard" && (
+            <Dashboard systems={systems} onNav={navTo} />
           )}
-          {view === "ai" && (
-            <div>
-              <h2 style={h2}>AI自動レビュー</h2>
-              <div style={card}>
-                <p style={{ fontSize: 13, color: "#475569", lineHeight: 1.75, margin: "0 0 14px" }}>
-                  調達仕様書・見積書のテキストを貼り付けると、DS-110/DS-910の観点からClaudeが自動レビューし、
-                  指摘事項をラリーに登録します。
-                </p>
-                <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 6,
-                              padding: "9px 14px", marginBottom: 14, fontSize: 11, color: "#92400e" }}>
-                  ⚠ docker-compose の ollama サービスが起動している必要があります（モデル変更: OLLAMA_MODEL 環境変数）
-                </div>
-                <textarea value={aiText} onChange={e => setAiText(e.target.value)}
-                  placeholder="調達仕様書・見積書・要件定義書等を貼り付けてください" rows={10}
-                  style={{ ...S.input, width: "100%", resize: "vertical", lineHeight: 1.6, boxSizing: "border-box", marginBottom: 12 }} />
-                <div style={{ display: "flex", justifyContent: "flex-end" }}>
-                  <button onClick={sendAi} disabled={aiLoading || !aiText.trim()}
-                    style={{ ...primaryBtn(aiLoading || !aiText.trim()), background: aiLoading || !aiText.trim() ? "#cbd5e1" : "#7c3aed" }}>
-                    {aiLoading ? "AIレビュー中..." : "🤖 AIレビュー実行"}
-                  </button>
-                </div>
-              </div>
-            </div>
+          {view === "systems" && (
+            <SystemsView headers={headers} showToast={showToast} />
+          )}
+          {view === "rally" && (
+            <RallyView initialSystemId={rallySystemId} headers={headers}
+                       showToast={showToast} currentRole={currentRole} />
+          )}
+          {view === "advisor" && (
+            <BudgetAdvisor api={API} headers={headers} />
           )}
           {view === "audit" && (
             <div>
-              <h2 style={h2}>監査ログ</h2>
-              <div style={card}>
-                <p style={{ fontSize: 12, color: "#64748b", margin: "0 0 16px" }}>全操作の記録（直近100件）</p>
-                {audit.length === 0
-                  ? <div style={empty}>ログなし</div>
-                  : <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-                      <thead>
-                        <tr style={{ background: "#f8fafc" }}>
-                          {["日時", "ユーザー", "操作", "対象テーブル", "対象ID"].map(h => (
-                            <th key={h} style={{ padding: "8px 10px", textAlign: "left",
-                                                 borderBottom: "2px solid #e2e8f0", fontWeight: 700, color: "#475569" }}>{h}</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {audit.map((a, i) => (
-                          <tr key={i} style={{ borderBottom: "1px solid #f1f5f9" }}>
-                            <td style={td}><span style={{ fontFamily: "monospace", fontSize: 11 }}>{a.created_at}</span></td>
-                            <td style={td}>{a.user_name}</td>
-                            <td style={td}><code style={{ background: "#f1f5f9", padding: "1px 6px", borderRadius: 3, fontSize: 11 }}>{a.action}</code></td>
-                            <td style={td}>{a.target_table}</td>
-                            <td style={td}>{a.target_id}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                }
+              <h2 style={S.h2}>監査ログ</h2>
+              <div style={S.card}>
+                <p style={{ fontSize: 12, color: "#64748b", margin: "0 0 12px" }}>全操作の記録</p>
+                <p style={{ fontSize: 12, color: "#94a3b8" }}>（事業を選択して監査ログを確認してください）</p>
               </div>
             </div>
           )}
           {view === "webhook" && (
             <div>
-              <h2 style={h2}>通知履歴（MCP/Webhook）</h2>
-              <div style={card}>
-                <p style={{ fontSize: 12, color: "#64748b", margin: "0 0 16px" }}>
-                  Agent Card形式（JSON-LD）でのWebhook送信履歴
-                </p>
-                {hooks.length === 0
-                  ? <div style={empty}>送信履歴なし（ラリー画面の 📡 ボタンで送信できます）</div>
-                  : <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-                      <thead>
-                        <tr style={{ background: "#f8fafc" }}>
-                          {["ID", "イベント", "ステータス", "作成日時", "送信日時"].map(h => (
-                            <th key={h} style={{ padding: "8px 10px", textAlign: "left",
-                                                 borderBottom: "2px solid #e2e8f0", fontWeight: 700, color: "#475569" }}>{h}</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {hooks.map(w => (
-                          <tr key={w.id} style={{ borderBottom: "1px solid #f1f5f9" }}>
-                            <td style={td}>{w.id}</td>
-                            <td style={td}><code style={{ background: "#f0fdf4", padding: "1px 6px", borderRadius: 3, fontSize: 11 }}>{w.event_type}</code></td>
-                            <td style={td}><span style={{ color: w.status === "sent" ? "#16a34a" : "#dc2626", fontWeight: 700, fontSize: 11 }}>{w.status}</span></td>
-                            <td style={td}><span style={{ fontFamily: "monospace", fontSize: 11 }}>{w.created_at}</span></td>
-                            <td style={td}><span style={{ fontFamily: "monospace", fontSize: 11 }}>{w.sent_at ?? "—"}</span></td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                }
+              <h2 style={S.h2}>通知履歴</h2>
+              <div style={S.card}>
+                <p style={{ fontSize: 12, color: "#64748b", margin: 0 }}>Agent Card形式（JSON-LD）でのWebhook送信履歴</p>
               </div>
             </div>
           )}
@@ -528,18 +750,3 @@ export default function App() {
     </div>
   );
 }
-
-const h2: React.CSSProperties = { fontSize: 15, fontWeight: 700, color: "#0f172a", margin: "0 0 16px" };
-const card: React.CSSProperties = { background: "#fff", borderRadius: 10, padding: "22px", boxShadow: "0 1px 3px rgba(0,0,0,0.07)" };
-const empty: React.CSSProperties = { textAlign: "center", color: "#94a3b8", padding: "36px 0", fontSize: 14 };
-const td: React.CSSProperties = { padding: "8px 10px", color: "#334155" };
-const primaryBtn = (disabled: boolean): React.CSSProperties => ({
-  background: disabled ? "#cbd5e1" : "#0f172a", color: "#fff", border: "none", borderRadius: 6,
-  padding: "9px 24px", fontSize: 13, fontWeight: 700,
-  cursor: disabled ? "not-allowed" : "pointer", fontFamily: "'Noto Sans JP',sans-serif",
-});
-const exportBtn = (color: string): React.CSSProperties => ({
-  background: "none", border: `1px solid ${color}`, color, borderRadius: 5,
-  padding: "5px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer",
-  fontFamily: "'Noto Sans JP',sans-serif",
-});

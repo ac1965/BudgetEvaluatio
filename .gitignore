@@ -4,9 +4,13 @@ nginx/certs/
 __pycache__/
 *.pyc
 node_modules/
-frontend/build/
-frontend/dist/
 .docker/
 .vscode/
 .idea/
 *.swp
+.env
+backend
+frontend
+nginx
+db
+docker-compose.*

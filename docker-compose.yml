@@ -34,8 +34,6 @@ services:
         condition: service_healthy
       ollama:
         condition: service_started
-    volumes:
-      - ./backend:/app
 
   frontend:
     build:
@@ -44,8 +42,8 @@ services:
       target: development
     ports:
       - "3005:3005"
-    environment:
-      REACT_APP_API_URL: http://localhost:8000
+    volumes:
+      - ./frontend/src:/app/src
     depends_on:
       - backend
 

@@ -1,0 +1,2304 @@
+#+TITLE: PJMO 予算評価レビューシステム
+#+AUTHOR: たかお
+#+DATE: 2025-04
+#+LANGUAGE: ja
+#+STARTUP: overview
+#+PROPERTY: header-args :mkdirp yes
+#+OPTIONS: toc:3 num:t ^:nil
+
+* 概要
+
+** システム概要
+
+日本の政府・公共調達における予算評価レビューを支援するWebアプリケーション。
+DS-110・DS-910標準に準拠した調達審査において、評価者とPJMOの往復レビュー（ラリー）を
+構造化・履歴管理し、AI（Claude API）による自動レビューと監査ログ出力を提供する。
+
+** レビューの流れ
+
+#+begin_example
+評価者 →[issue] 指摘
+   ↓
+PJMO   →[reply] 回答
+   ↓
+評価者 →[review] 再評価
+   ↓
+評価者 →[close] 確定
+#+end_example
+
+** アーキテクチャ
+
+#+begin_example
+Internet
+  │
+  ▼
+[nginx :443]  ← HTTPS終端・セキュリティヘッダー
+  ├─ /        → frontend  (React/TypeScript + Vite)
+  └─ /api/    → backend   (FastAPI / Python 3.12)
+                   └─ db  (PostgreSQL 16)
+#+end_example
+
+** 実装機能一覧
+
+| 機能                  | 説明                                                    |
+|-----------------------+---------------------------------------------------------|
+| ダッシュボード        | KPIカード・種別分布・完了率ドーナツ・アクティビティ5件  |
+| レビューラリー        | 評価者↔PJMO往復コメント・バージョン管理                 |
+| RBAC                  | admin/evaluator/pjmo/viewer の4ロール権限               |
+| AI自動レビュー        | Claude API による DS-110/DS-910 観点の自動指摘          |
+| 評価確定              | evaluator/admin による確定操作・確定者・日時記録        |
+| 監査ログ              | 全操作を audit_logs テーブルに記録                      |
+| Excel/PDFエクスポート | openpyxl / reportlab による監査ログ出力                 |
+| MCP/Webhook通知       | Agent Card（JSON-LD / schema.org）形式でイベント通知    |
+| 本番デプロイ          | nginx + HTTPS + multi-stage Docker build                |
+
+** ディレクトリ構成
+
+#+begin_example
+pjmo-review/
+├── README.org                ← 本ファイル（tangle source）
+├── docker-compose.yml        ← 開発環境（ポート3005）
+├── docker-compose.prod.yml   ← 本番環境（nginx HTTPS）
+├── .env.prod.example
+├── .gitignore
+├── db/
+│   └── init.sql
+├── backend/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── main.py
+│   ├── database.py
+│   ├── auth.py
+│   ├── review.py
+│   ├── projects.py
+│   ├── users_router.py
+│   ├── export_router.py
+│   └── notify_router.py
+├── frontend/
+│   ├── Dockerfile            ← node:20 + Vite（react-scripts廃止）
+│   ├── package.json          ← Vite 5.1.4
+│   ├── vite.config.ts
+│   ├── tsconfig.json
+│   ├── tsconfig.node.json
+│   ├── index.html            ← Vite形式（ルートに配置）
+│   └── src/
+│       ├── index.tsx
+│       └── App.tsx
+└── nginx/
+    ├── Dockerfile
+    ├── nginx.conf
+    └── gen-cert.sh
+#+end_example
+
+* tangle 手順
+
+#+begin_src emacs-lisp :eval no
+;; 全ファイルを一括生成
+(org-babel-tangle)
+#+end_src
+
+#+begin_src shell :eval no
+# コマンドラインから生成
+emacs --batch --eval "(require 'ob-tangle)" \
+      --eval "(org-babel-tangle-file \"README.org\")"
+#+end_src
+** org_tangle.py（Emacs不要のPython実装）
+
+#+begin_src python :tangle org_tangle.py
+#!/usr/bin/env python3
+"""org_tangle.py — Org-babel tangle を Python で再実装する.
+
+org-babel-tangle と同等のロジックで README.org から全ソースファイルを生成する。
+
+対応する Org-babel 機能:
+- #+BEGIN_SRC lang :tangle <path>  — ブロックレベルの tangle 指定
+- :PROPERTIES: / :header-args:lang: :tangle <path>  — セクションレベルのデフォルト
+- :tangle no  — スキップ
+- #+PROPERTY: header-args [:mkdirp yes  — ファイルレベルのデフォルト
+- 同一ファイルへの複数ブロック追記（org-babel と同じ動作）
+- noweb 参照は未対応（retranscribe には不要）
+
+使い方:
+    python org_tangle.py                     # カレントの README.org を処理
+    python org_tangle.py README.org          # ファイル指定
+    python org_tangle.py README.org --dry-run  # ファイル一覧のみ表示
+    python org_tangle.py README.org --out /tmp/out  # 出力先を指定
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+import textwrap
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# データ構造
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Block:
+    """1つの #+BEGIN_SRC ブロック."""
+    tangle: str           # 出力ファイルパス
+    lang: str             # 言語識別子
+    content: str          # ブロック本文
+    src_line: int         # 元ファイルの行番号（デバッグ用）
+
+
+# ---------------------------------------------------------------------------
+# パーサー
+# ---------------------------------------------------------------------------
+
+_BEGIN_SRC_RE = re.compile(
+    r"^\s*#\+BEGIN_SRC\s+(\S+)(.*)?$", re.IGNORECASE
+)
+_END_SRC_RE = re.compile(r"^\s*#\+END_SRC\s*$", re.IGNORECASE)
+
+_HEADER_ARGS_RE = re.compile(
+    r"^\s*:header-args(?::(\S+))?:\s+(.+)$", re.IGNORECASE
+)
+
+_PROPERTY_RE = re.compile(
+    r"^\s*#\+PROPERTY:\s+header-args(?::(\S+))?\s+(.+)$", re.IGNORECASE
+)
+
+def _extract_tangle(header_rest: str) -> Optional[str]:
+    """ヘッダー文字列から :tangle <value> を抽出する."""
+    m = re.search(r":tangle\s+(\S+)", header_rest)
+    if m:
+        v = m.group(1)
+        return None if v.lower() == "no" else v
+    return None
+
+
+def parse_org(text: str) -> list[Block]:
+    """Org テキストを走査して tangle 対象ブロックのリストを返す."""
+
+    lines = text.splitlines()
+    blocks: list[Block] = []
+
+    file_defaults: dict[str, Optional[str]] = {}
+    section_stack: list[dict[str, Optional[str]]] = [{}]
+    current_level = 0
+
+    in_properties = False
+    in_src = False
+    src_lang = ""
+    src_tangle: Optional[str] = None
+    src_lines: list[str] = []
+    src_start_line = 0
+
+    for lineno, line in enumerate(lines, 1):
+
+        if not in_src:
+            m = _PROPERTY_RE.match(line)
+            if m:
+                lang_key = (m.group(1) or "").lower()
+                tangle_val = _extract_tangle(m.group(2))
+                file_defaults[lang_key] = tangle_val
+                continue
+
+        if not in_src:
+            h = re.match(r"^(\*+)\s", line)
+            if h:
+                lvl = len(h.group(1))
+                while len(section_stack) > lvl:
+                    section_stack.pop()
+                while len(section_stack) <= lvl:
+                    section_stack.append(dict(section_stack[-1]))
+                current_level = lvl
+                in_properties = False
+                continue
+
+        if not in_src:
+            if line.strip() == ":PROPERTIES:":
+                in_properties = True
+                continue
+            if line.strip() == ":END:":
+                in_properties = False
+                continue
+            if in_properties:
+                m = _HEADER_ARGS_RE.match(line)
+                if m:
+                    lang_key = (m.group(1) or "").lower()
+                    tangle_val = _extract_tangle(m.group(2))
+                    if tangle_val is not None:
+                        section_stack[-1][lang_key] = tangle_val
+                    elif ":tangle" in m.group(2).lower():
+                        section_stack[-1][lang_key] = None
+                continue
+
+        if not in_src:
+            m = _BEGIN_SRC_RE.match(line)
+            if m:
+                lang = m.group(1).lower()
+                header_rest = m.group(2) or ""
+
+                block_tangle = _extract_tangle(header_rest)
+
+                if block_tangle is None and ":tangle" not in header_rest.lower():
+                    sec = section_stack[-1]
+                    if lang in sec:
+                        block_tangle = sec[lang]
+                    elif "" in sec:
+                        block_tangle = sec[""]
+                    elif lang in file_defaults:
+                        block_tangle = file_defaults[lang]
+                    elif "" in file_defaults:
+                        block_tangle = file_defaults[""]
+
+                in_src = True
+                src_lang = lang
+                src_tangle = block_tangle
+                src_lines = []
+                src_start_line = lineno
+                continue
+
+        else:
+            if _END_SRC_RE.match(line):
+                if src_tangle:
+                    blocks.append(Block(
+                        tangle=src_tangle,
+                        lang=src_lang,
+                        content="\n".join(src_lines),
+                        src_line=src_start_line,
+                    ))
+                in_src = False
+                src_lang = ""
+                src_tangle = None
+                src_lines = []
+                continue
+            src_lines.append(line)
+
+    return blocks
+
+
+# ---------------------------------------------------------------------------
+# 書き出し
+# ---------------------------------------------------------------------------
+
+def write_files(
+    blocks: list[Block],
+    base_dir: Path,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """ブロック群をファイルに書き出す."""
+
+    file_blocks: dict[str, list[Block]] = {}
+    for block in blocks:
+        file_blocks.setdefault(block.tangle, []).append(block)
+
+    result: dict[str, int] = {}
+
+    for rel_path, blks in file_blocks.items():
+        out_path = base_dir / rel_path
+        result[rel_path] = len(blks)
+
+        if dry_run:
+            continue
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", encoding="utf-8") as f:
+            for i, blk in enumerate(blks):
+                if i > 0:
+                    f.write("\n")
+                content = textwrap.dedent(blk.content)
+                f.write(content)
+                if content and not content.endswith("\n"):
+                    f.write("\n")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Org-babel tangle を Python で実行する",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "org_file",
+        nargs="?",
+        default="README.org",
+        help="Org ファイルのパス（デフォルト: README.org）",
+    )
+    parser.add_argument(
+        "--out", "-o",
+        default=None,
+        help="出力ベースディレクトリ（デフォルト: org ファイルと同じディレクトリ）",
+    )
+    parser.add_argument(
+        "--dry-run", "-n",
+        action="store_true",
+        help="ファイルを書き出さずにtangleターゲットの一覧のみ表示",
+    )
+    parser.add_argument(
+        "--lang",
+        default=None,
+        help="指定した言語のブロックのみ処理（例: python, toml）",
+    )
+    parser.add_argument(
+        "--file", "-f",
+        default=None,
+        help="指定したtangleパスのブロックのみ処理（例: backend/review.py）",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="処理中の詳細を表示",
+    )
+
+    args = parser.parse_args()
+
+    org_path = Path(args.org_file)
+    if not org_path.exists():
+        print(f"Error: {org_path} が見つかりません", file=sys.stderr)
+        sys.exit(1)
+
+    base_dir = Path(args.out) if args.out else org_path.parent
+
+    text = org_path.read_text(encoding="utf-8")
+    blocks = parse_org(text)
+
+    if args.lang:
+        blocks = [b for b in blocks if b.lang == args.lang.lower()]
+    if args.file:
+        blocks = [b for b in blocks if b.tangle == args.file]
+
+    if not blocks:
+        print("tangle対象ブロックが見つかりませんでした。")
+        sys.exit(0)
+
+    result = write_files(blocks, base_dir, dry_run=args.dry_run)
+
+    if args.dry_run:
+        print(f"[dry-run] tangle対象: {len(result)} ファイル")
+        for rel, count in sorted(result.items()):
+            print(f"  {rel}  ({count} ブロック)")
+    else:
+        total_blocks = sum(result.values())
+        print(f"tangle完了: {len(result)} ファイル / {total_blocks} ブロック")
+        if args.verbose:
+            for rel, count in sorted(result.items()):
+                out = base_dir / rel
+                size = out.stat().st_size
+                print(f"  {rel}  ({count} ブロック, {size:,} bytes)")
+        else:
+            for rel in sorted(result.keys()):
+                print(f"  {rel}")
+
+
+if __name__ == "__main__":
+    main()
+#+end_src
+
+
+
+Emacsなしで tangle を実行するためのスタンドアロンPythonスクリプト。
+=org-babel-tangle= と同等のロジックを実装しており、CI/CDやサーバー環境でも動作する。
+
+#+begin_src shell :eval no
+# 全ファイルを生成
+python org_tangle.py
+
+# ドライラン（ファイル一覧のみ表示）
+python org_tangle.py --dry-run
+
+# 特定ファイルのみ
+python org_tangle.py --file backend/review.py
+
+# 出力先を指定
+python org_tangle.py --out /tmp/pjmo-out
+#+end_src
+
+
+
+* データベース
+
+** スキーマ + サンプルデータ
+
+#+begin_src sql :tangle db/init.sql
+-- RBAC
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
+    display_name TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('admin', 'evaluator', 'pjmo', 'viewer')),
+    created_at TIMESTAMP DEFAULT now()
+);
+
+-- プロジェクト
+CREATE TABLE IF NOT EXISTS projects (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    created_at TIMESTAMP DEFAULT now()
+);
+
+-- レビューログ（バージョン・確定情報付き）
+CREATE TABLE IF NOT EXISTS review_logs (
+    id SERIAL PRIMARY KEY,
+    project_id INT REFERENCES projects(id),
+    author TEXT NOT NULL,
+    role TEXT NOT NULL,
+    comment TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('issue', 'reply', 'review', 'close')),
+    version INT NOT NULL DEFAULT 1,
+    confirmed_at TIMESTAMP,
+    confirmed_by TEXT,
+    created_at TIMESTAMP DEFAULT now()
+);
+
+-- MCP/Webhook通知ログ
+CREATE TABLE IF NOT EXISTS webhook_logs (
+    id SERIAL PRIMARY KEY,
+    project_id INT REFERENCES projects(id),
+    event_type TEXT NOT NULL,
+    payload JSONB,
+    status TEXT NOT NULL DEFAULT 'pending',
+    sent_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT now()
+);
+
+-- 監査ログ
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id SERIAL PRIMARY KEY,
+    project_id INT,
+    user_name TEXT,
+    action TEXT NOT NULL,
+    target_table TEXT,
+    target_id INT,
+    detail JSONB,
+    created_at TIMESTAMP DEFAULT now()
+);
+
+-- サンプルデータ
+INSERT INTO users (username, display_name, role) VALUES
+    ('tanaka', '田中係長', 'evaluator'),
+    ('yamada', '山田主任', 'pjmo'),
+    ('suzuki', '鈴木部長', 'admin'),
+    ('ai_reviewer', 'AIレビュー', 'viewer')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO projects (name, description) VALUES
+    ('令和7年度 情報システム整備事業', 'DS-110準拠 調達審査対象'),
+    ('行政DX基盤構築PJ', 'DS-910準拠 クラウド移行')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO review_logs (project_id, author, role, comment, status, version) VALUES
+    (1, '田中係長', '評価者', '積算根拠の内訳が不明確です。FP法による規模見積もりの詳細を提示してください。', 'issue', 1),
+    (1, '山田主任', 'PJMO', 'FP計算書（別紙3）を追加しました。機能点数142FP、開発工数2.8PY相当です。', 'reply', 1),
+    (1, '田中係長', '評価者', '積算根拠を確認しました。ただしクラウド移行コストの根拠が不足しています。', 'review', 1),
+    (1, 'LLMレビュー', 'AI', 'DS-110第4.2条に基づく調達仕様書確認：セキュリティ要件（第6条）の記載が不十分です。ISMAP準拠クラウドサービスの選定基準を明示してください。', 'issue', 1);
+#+end_src
+
+* バックエンド
+
+** requirements.txt
+
+#+begin_src text :tangle backend/requirements.txt
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+sqlalchemy==2.0.35
+psycopg2-binary==2.9.9
+python-dotenv==1.0.1
+httpx==0.27.2
+pydantic==2.9.2
+openpyxl==3.1.5
+reportlab==4.2.5
+#+end_src
+
+** Dockerfile
+
+#+begin_src dockerfile :tangle backend/Dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+#+end_src
+
+** database.py
+
+#+begin_src python :tangle backend/database.py
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+import os
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://budget:budget@db:5432/budget"
+)
+
+engine = create_engine(DATABASE_URL)
+Session = sessionmaker(bind=engine)
+
+
+def get_db():
+    db = Session()
+    try:
+        yield db
+    finally:
+        db.close()
+#+end_src
+
+** auth.py（RBAC）
+
+| ロール    | read | write | confirm | export | manage |
+|-----------+------+-------+---------+--------+--------|
+| admin     | ✓    | ✓     | ✓       | ✓      | ✓      |
+| evaluator | ✓    | ✓     | ✓       | ✓      |        |
+| pjmo      | ✓    | ✓     |         |        |        |
+| viewer    | ✓    |       |         |        |        |
+
+#+begin_src python :tangle backend/auth.py
+"""
+RBAC モジュール
+現在: X-User-Name / X-User-Role ヘッダーによるシンプル認証
+本番: Keycloak JWT検証に差し替え
+"""
+from fastapi import Header, HTTPException, Depends
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from database import get_db
+from typing import Optional
+
+ROLE_PERMISSIONS = {
+    "admin":     {"read", "write", "confirm", "export", "manage"},
+    "evaluator": {"read", "write", "confirm"},
+    "pjmo":      {"read", "write"},
+    "viewer":    {"read"},
+}
+
+
+class UserContext:
+    def __init__(self, username: str, display_name: str, role: str):
+        self.username = username
+        self.display_name = display_name
+        self.role = role
+
+    def can(self, permission: str) -> bool:
+        return permission in ROLE_PERMISSIONS.get(self.role, set())
+
+    def require(self, permission: str):
+        if not self.can(permission):
+            raise HTTPException(
+                status_code=403,
+                detail=f"権限不足: {permission} が必要です（現在のロール: {self.role}）"
+            )
+
+
+def get_current_user(
+    x_user_name: Optional[str] = Header(default=None),
+    x_user_role: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+) -> UserContext:
+    if not x_user_name:
+        return UserContext("anonymous", "匿名ユーザー", "viewer")
+    row = db.execute(
+        text("SELECT display_name, role FROM users WHERE username=:u"),
+        {"u": x_user_name}
+    ).fetchone()
+    if row:
+        return UserContext(x_user_name, row.display_name, row.role)
+    valid_roles = set(ROLE_PERMISSIONS.keys())
+    role = x_user_role if x_user_role in valid_roles else "viewer"
+    return UserContext(x_user_name, x_user_name, role)
+#+end_src
+
+** main.py
+
+#+begin_src python :tangle backend/main.py
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from review import router as review_router
+from projects import router as projects_router
+from export_router import router as export_router
+from notify_router import router as notify_router
+from users_router import router as users_router
+
+app = FastAPI(title="PJMO Review API", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3005"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(review_router)
+app.include_router(projects_router)
+app.include_router(export_router)
+app.include_router(notify_router)
+app.include_router(users_router)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "version": "2.0.0"}
+#+end_src
+
+** projects.py
+
+#+begin_src python :tangle backend/projects.py
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from database import get_db
+
+router = APIRouter(prefix="/projects", tags=["projects"])
+
+
+@router.get("/")
+def list_projects(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text("SELECT id, name, description FROM projects ORDER BY id")
+    ).fetchall()
+    return [dict(r._mapping) for r in rows]
+#+end_src
+
+** users_router.py
+
+#+begin_src python :tangle backend/users_router.py
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from database import get_db
+from auth import get_current_user, UserContext
+
+router = APIRouter(prefix="/users", tags=["users"])
+
+
+@router.get("/")
+def list_users(db: Session = Depends(get_db),
+               user: UserContext = Depends(get_current_user)):
+    user.require("read")
+    rows = db.execute(
+        text("SELECT username, display_name, role FROM users ORDER BY id")
+    ).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+@router.get("/me")
+def me(user: UserContext = Depends(get_current_user)):
+    return {
+        "username": user.username,
+        "display_name": user.display_name,
+        "role": user.role,
+        "permissions": list(
+            {"read", "write", "confirm", "export", "manage"}
+            if user.role == "admin"
+            else {"read", "write", "confirm"} if user.role == "evaluator"
+            else {"read", "write"} if user.role == "pjmo"
+            else {"read"}
+        ),
+    }
+#+end_src
+
+** review.py
+
+#+begin_src python :tangle backend/review.py
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from pydantic import BaseModel
+from database import get_db
+from auth import get_current_user, UserContext
+import os, httpx, json
+
+router = APIRouter(prefix="/review", tags=["review"])
+
+
+class ReviewPost(BaseModel):
+    project_id: int
+    author: str
+    role: str
+    comment: str
+    status: str
+
+
+class AutoReviewRequest(BaseModel):
+    project_id: int
+    text: str
+
+
+class ConfirmRequest(BaseModel):
+    confirmed_by: str
+
+
+def _audit(db, project_id, user_name, action, target_table=None, target_id=None, detail=None):
+    db.execute(
+        text("""
+            INSERT INTO audit_logs (project_id, user_name, action, target_table, target_id, detail)
+            VALUES (:p, :u, :a, :tt, :ti, :d::jsonb)
+        """),
+        {"p": project_id, "u": user_name, "a": action, "tt": target_table,
+         "ti": target_id, "d": json.dumps(detail or {}, ensure_ascii=False)}
+    )
+
+
+@router.get("/{project_id}")
+def get_review(project_id: int, db: Session = Depends(get_db),
+               user: UserContext = Depends(get_current_user)):
+    user.require("read")
+    rows = db.execute(
+        text("""
+            SELECT id, author, role, comment, status, version,
+                   confirmed_by,
+                   to_char(confirmed_at, 'YYYY-MM-DD HH24:MI') AS confirmed_at,
+                   to_char(created_at, 'YYYY-MM-DD HH24:MI') AS created_at
+            FROM review_logs
+            WHERE project_id = :id
+            ORDER BY created_at
+        """),
+        {"id": project_id}
+    ).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+@router.post("/")
+def post_review(data: ReviewPost, db: Session = Depends(get_db),
+                user: UserContext = Depends(get_current_user)):
+    user.require("write")
+    if data.status not in {"issue", "reply", "review", "close"}:
+        raise HTTPException(status_code=400, detail=f"Invalid status: {data.status}")
+    ver = db.execute(
+        text("SELECT COALESCE(MAX(version),0) FROM review_logs WHERE project_id=:p"),
+        {"p": data.project_id}
+    ).scalar()
+    result = db.execute(
+        text("""
+            INSERT INTO review_logs (project_id,author,role,comment,status,version)
+            VALUES (:p,:a,:r,:c,:s,:v) RETURNING id
+        """),
+        {"p": data.project_id, "a": data.author, "r": data.role,
+         "c": data.comment, "s": data.status, "v": ver+1}
+    )
+    new_id = result.fetchone()[0]
+    _audit(db, data.project_id, user.username, "post_review", "review_logs", new_id,
+           {"status": data.status, "version": ver+1})
+    db.commit()
+    return {"status": "ok", "id": new_id, "version": ver+1}
+
+
+@router.post("/{log_id}/confirm")
+def confirm_review(log_id: int, req: ConfirmRequest, db: Session = Depends(get_db),
+                   user: UserContext = Depends(get_current_user)):
+    user.require("confirm")
+    row = db.execute(
+        text("SELECT project_id, status FROM review_logs WHERE id=:id"),
+        {"id": log_id}
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+    if row.status == "close":
+        raise HTTPException(status_code=400, detail="既に確定済み")
+    db.execute(
+        text("UPDATE review_logs SET status='close', confirmed_by=:by, confirmed_at=now() WHERE id=:id"),
+        {"by": req.confirmed_by, "id": log_id}
+    )
+    _audit(db, row.project_id, user.username, "confirm_review", "review_logs", log_id,
+           {"confirmed_by": req.confirmed_by})
+    db.commit()
+    return {"status": "ok", "confirmed": True}
+
+
+@router.post("/auto")
+async def auto_review(req: AutoReviewRequest, db: Session = Depends(get_db),
+                      user: UserContext = Depends(get_current_user)):
+    user.require("write")
+    ollama_url   = os.getenv("OLLAMA_URL",   "http://ollama:11434")
+    ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5")
+    system_prompt = """あなたは日本の政府IT調達のデジタル統括アドバイザーです。
+DS-110・DS-910の観点から調達仕様書・見積書をレビューし、具体的な指摘事項を200字以内で箇条書き。条文番号を明示。"""
+    payload = {
+        "model": ollama_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": req.text},
+        ],
+        "stream": False,
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(
+            f"{ollama_url}/api/chat",
+            json=payload,
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Ollama API error: {resp.text[:200]}")
+    comment = resp.json()["message"]["content"]
+    ver = db.execute(
+        text("SELECT COALESCE(MAX(version),0) FROM review_logs WHERE project_id=:p"),
+        {"p": req.project_id}
+    ).scalar()
+    result = db.execute(
+        text("INSERT INTO review_logs (project_id,author,role,comment,status,version) VALUES (:p,'AI自動レビュー','AI',:c,'issue',:v) RETURNING id"),
+        {"p": req.project_id, "c": comment, "v": ver+1}
+    )
+    new_id = result.fetchone()[0]
+    _audit(db, req.project_id, "ai", "auto_review", "review_logs", new_id, {})
+    db.commit()
+    return {"status": "ok", "comment": comment, "id": new_id}
+
+
+@router.delete("/{log_id}")
+def close_review(log_id: int, db: Session = Depends(get_db),
+                 user: UserContext = Depends(get_current_user)):
+    user.require("write")
+    row = db.execute(text("SELECT project_id FROM review_logs WHERE id=:id"), {"id": log_id}).fetchone()
+    db.execute(text("UPDATE review_logs SET status='close' WHERE id=:id"), {"id": log_id})
+    if row:
+        _audit(db, row.project_id, user.username, "close_review", "review_logs", log_id, {})
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.get("/{project_id}/audit")
+def get_audit(project_id: int, db: Session = Depends(get_db),
+              user: UserContext = Depends(get_current_user)):
+    user.require("confirm")
+    rows = db.execute(
+        text("""
+            SELECT user_name, action, target_table, target_id, detail,
+                   to_char(created_at,'YYYY-MM-DD HH24:MI:SS') AS created_at
+            FROM audit_logs WHERE project_id=:p ORDER BY created_at DESC LIMIT 100
+        """),
+        {"p": project_id}
+    ).fetchall()
+    return [dict(r._mapping) for r in rows]
+#+end_src
+
+** export_router.py
+
+#+begin_src python :tangle backend/export_router.py
+"""
+監査ログ エクスポート（Excel / PDF）
+evaluator / admin のみ実行可
+"""
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from database import get_db
+from auth import get_current_user, UserContext
+import io
+from datetime import datetime
+
+router = APIRouter(prefix="/export", tags=["export"])
+
+
+def _fetch_logs(project_id: int, db: Session):
+    rows = db.execute(
+        text("""
+            SELECT r.id, r.author, r.role, r.comment, r.status,
+                   r.version, r.confirmed_at, r.confirmed_by,
+                   to_char(r.created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
+                   p.name AS project_name
+            FROM review_logs r
+            JOIN projects p ON p.id = r.project_id
+            WHERE r.project_id = :id
+            ORDER BY r.created_at
+        """),
+        {"id": project_id}
+    ).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+@router.get("/{project_id}/excel")
+def export_excel(project_id: int, db: Session = Depends(get_db),
+                 user: UserContext = Depends(get_current_user)):
+    user.require("export")
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        raise HTTPException(status_code=503, detail="openpyxl not installed")
+
+    logs = _fetch_logs(project_id, db)
+    if not logs:
+        raise HTTPException(status_code=404, detail="レビューログなし")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "レビューラリー"
+
+    STATUS_FILL = {
+        "issue":  PatternFill("solid", fgColor="FCE4EC"),
+        "reply":  PatternFill("solid", fgColor="E8F5E9"),
+        "review": PatternFill("solid", fgColor="FFF9C4"),
+        "close":  PatternFill("solid", fgColor="F5F5F5"),
+    }
+    HEADER_FONT = Font(bold=True, color="FFFFFF", name="Meiryo")
+    HEADER_FILL = PatternFill("solid", fgColor="1A2340")
+    thin = Side(style="thin", color="CCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    headers = ["#", "日時", "バージョン", "役割", "氏名", "種別", "コメント", "確定者", "確定日時"]
+    col_widths = [5, 16, 10, 10, 14, 8, 60, 14, 18]
+
+    project_name = logs[0]["project_name"]
+    ws.merge_cells("A1:I1")
+    ws["A1"].value = f"レビューラリー監査ログ：{project_name}"
+    ws["A1"].font = Font(bold=True, size=13, name="Meiryo")
+    ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[1].height = 24
+    ws.merge_cells("A2:I2")
+    ws["A2"].value = f"出力日時：{datetime.now().strftime('%Y-%m-%d %H:%M')}　件数：{len(logs)}件"
+    ws["A2"].font = Font(size=9, color="666666", name="Meiryo")
+    ws.row_dimensions[2].height = 16
+
+    for col, (h, w) in enumerate(zip(headers, col_widths), 1):
+        cell = ws.cell(row=3, column=col, value=h)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+        ws.column_dimensions[get_column_letter(col)].width = w
+    ws.row_dimensions[3].height = 20
+
+    STATUS_LABEL = {"issue": "指摘", "reply": "回答", "review": "再評価", "close": "確定"}
+    for i, log in enumerate(logs, 1):
+        row = i + 3
+        values = [i, log["created_at"], f"v{log['version']}", log["role"], log["author"],
+                  STATUS_LABEL.get(log["status"], log["status"]), log["comment"],
+                  log["confirmed_by"] or "", log["confirmed_at"] or ""]
+        fill = STATUS_FILL.get(log["status"], PatternFill())
+        aligns = ["center","center","center","center","center","center","left","center","center"]
+        for col, (val, align) in enumerate(zip(values, aligns), 1):
+            cell = ws.cell(row=row, column=col, value=val)
+            cell.fill = fill
+            cell.border = border
+            cell.font = Font(name="Meiryo", size=9)
+            cell.alignment = Alignment(horizontal=align, vertical="top", wrap_text=(col == 7))
+        ws.row_dimensions[row].height = 40
+
+    ws.freeze_panes = "A4"
+    ws.auto_filter.ref = f"A3:I{len(logs)+3}"
+
+    ws2 = wb.create_sheet("監査メタ")
+    ws2["A1"] = "項目"; ws2["B1"] = "値"
+    ws2["A1"].font = Font(bold=True); ws2["B1"].font = Font(bold=True)
+    meta = [
+        ("プロジェクト", project_name),
+        ("出力日時", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        ("総件数", len(logs)),
+        ("指摘件数", sum(1 for l in logs if l["status"] == "issue")),
+        ("回答件数", sum(1 for l in logs if l["status"] == "reply")),
+        ("確定件数", sum(1 for l in logs if l["status"] == "close")),
+    ]
+    for r, (k, v) in enumerate(meta, 2):
+        ws2[f"A{r}"] = k; ws2[f"B{r}"] = v
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = f"review_log_pj{project_id}_{datetime.now().strftime('%Y%m%d%H%M')}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
+    )
+
+
+@router.get("/{project_id}/pdf")
+def export_pdf(project_id: int, db: Session = Depends(get_db),
+               user: UserContext = Depends(get_current_user)):
+    user.require("export")
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.lib import colors
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    except ImportError:
+        raise HTTPException(status_code=503, detail="reportlab not installed")
+
+    logs = _fetch_logs(project_id, db)
+    if not logs:
+        raise HTTPException(status_code=404, detail="レビューログなし")
+
+    pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
+    FONT = "HeiseiKakuGo-W5"
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=15*mm, rightMargin=15*mm,
+                            topMargin=20*mm, bottomMargin=20*mm)
+    STATUS_LABEL = {"issue": "指摘", "reply": "回答", "review": "再評価", "close": "確定"}
+    STATUS_COLOR = {
+        "issue":  colors.HexColor("#FCE4EC"),
+        "reply":  colors.HexColor("#E8F5E9"),
+        "review": colors.HexColor("#FFF9C4"),
+        "close":  colors.HexColor("#F5F5F5"),
+    }
+    title_style = ParagraphStyle("title", fontName=FONT, fontSize=14, spaceAfter=4)
+    sub_style   = ParagraphStyle("sub",   fontName=FONT, fontSize=8, textColor=colors.grey)
+    cell_style  = ParagraphStyle("cell",  fontName=FONT, fontSize=7.5, leading=11)
+
+    project_name = logs[0]["project_name"]
+    story = [
+        Paragraph("レビューラリー監査ログ", title_style),
+        Paragraph(f"対象PJ：{project_name}　出力日時：{datetime.now().strftime('%Y-%m-%d %H:%M')}　件数：{len(logs)}件", sub_style),
+        Spacer(1, 4*mm),
+        HRFlowable(width="100%", thickness=1, color=colors.HexColor("#1A2340")),
+        Spacer(1, 3*mm),
+    ]
+    table_data = [["#", "日時", "役割/氏名", "種別", "コメント"]]
+    for i, log in enumerate(logs, 1):
+        table_data.append([
+            str(i), log["created_at"],
+            Paragraph(f"{log['role']}\n{log['author']}", cell_style),
+            STATUS_LABEL.get(log["status"], log["status"]),
+            Paragraph(log["comment"], cell_style),
+        ])
+    t = Table(table_data, colWidths=[10*mm, 28*mm, 24*mm, 14*mm, None], repeatRows=1)
+    t.setStyle(TableStyle([
+        ("FONTNAME",    (0, 0), (-1, -1), FONT),
+        ("FONTSIZE",    (0, 0), (-1, -1), 7.5),
+        ("TEXTCOLOR",   (0, 0), (-1, 0),  colors.white),
+        ("BACKGROUND",  (0, 0), (-1, 0),  colors.HexColor("#1A2340")),
+        ("ALIGN",       (0, 0), (3, -1),  "CENTER"),
+        ("VALIGN",      (0, 0), (-1, -1), "TOP"),
+        ("GRID",        (0, 0), (-1, -1), 0.4, colors.HexColor("#CCCCCC")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [STATUS_COLOR.get(l["status"], colors.white) for l in logs]),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 4),
+    ]))
+    story.append(t)
+    doc.build(story)
+    buf.seek(0)
+    filename = f"review_log_pj{project_id}_{datetime.now().strftime('%Y%m%d%H%M')}.pdf"
+    return StreamingResponse(
+        buf, media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
+    )
+#+end_src
+
+** notify_router.py
+
+#+begin_src python :tangle backend/notify_router.py
+"""
+A2A/MCP連携 通知モジュール
+Agent Card（JSON-LD / schema.org）形式でイベントを外部に通知
+"""
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from database import get_db
+from auth import get_current_user, UserContext
+import os, httpx, json
+from datetime import datetime
+
+router = APIRouter(prefix="/notify", tags=["notify"])
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+
+
+def build_agent_card(event_type: str, log: dict, project_name: str) -> dict:
+    STATUS_LABEL = {"issue": "指摘", "reply": "回答", "review": "再評価", "close": "確定"}
+    return {
+        "@context": "https://schema.org",
+        "@type": "ReviewAction",
+        "identifier": f"pjmo-review-{log['id']}",
+        "name": f"[{STATUS_LABEL.get(log['status'], log['status'])}] {project_name}",
+        "description": log["comment"][:200],
+        "agent": {"@type": "Person", "name": log["author"], "jobTitle": log["role"]},
+        "object": {"@type": "GovernmentService", "name": project_name},
+        "actionStatus": event_type,
+        "startTime": log.get("created_at", ""),
+        "pjmo_metadata": {
+            "project_id": log["project_id"], "log_id": log["id"],
+            "status": log["status"], "version": log.get("version", 1),
+        }
+    }
+
+
+async def _send_webhook(payload: dict, project_id: int, event_type: str, db: Session):
+    if not WEBHOOK_URL:
+        return
+    sent_at = None
+    status = "failed"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(WEBHOOK_URL, json=payload,
+                                     headers={"Content-Type": "application/json"})
+        status = "sent" if resp.status_code < 400 else "failed"
+        sent_at = datetime.now()
+    except Exception as e:
+        status = f"error: {str(e)[:100]}"
+    db.execute(
+        text("""
+            INSERT INTO webhook_logs (project_id, event_type, payload, status, sent_at)
+            VALUES (:p, :e, :payload::jsonb, :s, :t)
+        """),
+        {"p": project_id, "e": event_type,
+         "payload": json.dumps(payload, ensure_ascii=False), "s": status, "t": sent_at}
+    )
+    db.commit()
+
+
+@router.post("/review/{log_id}")
+async def notify_review(log_id: int, background_tasks: BackgroundTasks,
+                        db: Session = Depends(get_db),
+                        user: UserContext = Depends(get_current_user)):
+    user.require("write")
+    row = db.execute(
+        text("SELECT r.*, p.name AS project_name FROM review_logs r JOIN projects p ON p.id=r.project_id WHERE r.id=:id"),
+        {"id": log_id}
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="ログが見つかりません")
+    log = dict(row._mapping)
+    payload = build_agent_card("review_posted", log, log["project_name"])
+    background_tasks.add_task(_send_webhook, payload, log["project_id"], "review_posted", db)
+    return {"status": "queued", "payload_preview": payload}
+
+
+@router.get("/logs/{project_id}")
+def get_webhook_logs(project_id: int, db: Session = Depends(get_db),
+                     user: UserContext = Depends(get_current_user)):
+    user.require("read")
+    rows = db.execute(
+        text("""
+            SELECT id, event_type, status,
+                   to_char(created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
+                   to_char(sent_at, 'YYYY-MM-DD HH24:MI') AS sent_at
+            FROM webhook_logs WHERE project_id=:p ORDER BY created_at DESC LIMIT 50
+        """),
+        {"p": project_id}
+    ).fetchall()
+    return [dict(r._mapping) for r in rows]
+#+end_src
+
+* フロントエンド
+
+** 構成メモ
+
+#+begin_quote
+react-scripts 5 + Node 18/20 の組み合わせは ajv/fork-ts-checker-webpack-plugin の
+依存関係競合が解決不能だったため、*Vite 5 + Node 20* に移行した。
+#+end_quote
+
+| 項目 | 旧（廃止） | 新（採用） |
+|------+------------+------------|
+| ビルダー | react-scripts 5.0.1 | Vite 5.1.4 |
+| Node | 18-slim | 20-slim |
+| 問題 | ajv/fork-ts-checker競合 | なし |
+| ポート | 3000（競合で3001変更） | 3001 |
+
+** package.json
+
+#+begin_src json :tangle frontend/package.json
+{
+  "name": "pjmo-review-frontend",
+  "version": "2.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "18.2.0",
+    "react-dom": "18.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "18.2.0",
+    "@types/react-dom": "18.2.0",
+    "@vitejs/plugin-react": "4.2.1",
+    "typescript": "5.3.3",
+    "vite": "5.1.4"
+  },
+  "scripts": {
+    "start": "vite --host 0.0.0.0 --port 3005",
+    "build": "vite build",
+    "preview": "vite preview"
+  }
+}
+#+end_src
+
+** vite.config.ts
+
+#+begin_src typescript :tangle frontend/vite.config.ts
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    host: '0.0.0.0',
+    port: 3005,
+    proxy: {
+      '/api': {
+        target: process.env.REACT_APP_API_URL || 'http://backend:8000',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, ''),
+      },
+    },
+  },
+  define: {
+    'process.env.REACT_APP_API_URL': JSON.stringify(
+      process.env.REACT_APP_API_URL || 'http://localhost:8000'
+    ),
+  },
+})
+#+end_src
+
+** tsconfig.json
+
+#+begin_src json :tangle frontend/tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": false
+  },
+  "include": ["src"],
+  "references": [{ "path": "./tsconfig.node.json" }]
+}
+#+end_src
+
+** tsconfig.node.json
+
+#+begin_src json :tangle frontend/tsconfig.node.json
+{
+  "compilerOptions": {
+    "composite": true,
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true
+  },
+  "include": ["vite.config.ts"]
+}
+#+end_src
+
+** index.html（Vite形式・ルートに配置）
+
+#+begin_src html :tangle frontend/index.html
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PJMO レビューシステム</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/index.tsx"></script>
+  </body>
+</html>
+#+end_src
+
+** Dockerfile（node:20 + Vite・マルチステージ）
+
+#+begin_src dockerfile :tangle frontend/Dockerfile
+FROM node:20-slim AS development
+WORKDIR /app
+COPY package.json ./
+RUN npm install
+COPY index.html vite.config.ts tsconfig.json tsconfig.node.json ./
+COPY src/ ./src/
+ENV REACT_APP_API_URL=http://localhost:8000
+EXPOSE 3005
+CMD ["npm", "start"]
+
+FROM node:20-slim AS builder
+WORKDIR /app
+COPY package.json ./
+RUN npm install
+COPY index.html vite.config.ts tsconfig.json tsconfig.node.json ./
+COPY src/ ./src/
+ARG REACT_APP_API_URL=/api
+ENV REACT_APP_API_URL=$REACT_APP_API_URL
+RUN npm run build
+
+FROM nginx:1.27-alpine AS production
+COPY --from=builder /app/dist /usr/share/nginx/html
+RUN printf 'server {\n  listen 80;\n  root /usr/share/nginx/html;\n  index index.html;\n  location / { try_files $uri $uri/ /index.html; }\n}\n' \
+    > /etc/nginx/conf.d/default.conf
+EXPOSE 80
+#+end_src
+
+** src/index.tsx
+
+#+begin_src typescript :tangle frontend/src/index.tsx
+import React from "react";
+import ReactDOM from "react-dom/client";
+import App from "./App";
+
+const root = ReactDOM.createRoot(document.getElementById("root") as HTMLElement);
+root.render(<App />);
+#+end_src
+
+** src/App.tsx
+
+#+begin_src typescript :tangle frontend/src/App.tsx
+import React, { useEffect, useState, useCallback } from "react";
+
+type Status = "issue" | "reply" | "review" | "close";
+type UserRole = "admin" | "evaluator" | "pjmo" | "viewer";
+type View = "dashboard" | "rally" | "ai" | "audit" | "webhook";
+
+interface ReviewLog {
+  id: number; author: string; role: string; comment: string;
+  status: Status; version: number;
+  confirmed_by: string | null; confirmed_at: string | null; created_at: string;
+}
+interface Project { id: number; name: string; description: string; }
+interface AuditEntry { user_name: string; action: string; target_table: string; target_id: number; created_at: string; }
+interface WebhookLog { id: number; event_type: string; status: string; created_at: string; sent_at: string | null; }
+
+// process.env は Vite の define で展開される
+const API = (typeof process !== "undefined" && process.env?.REACT_APP_API_URL) || "http://localhost:8000";
+
+const SC: Record<Status, { label: string; color: string; bg: string; border: string; hex: string }> = {
+  issue:  { label: "指摘",   color: "#b91c1c", bg: "#fef2f2", border: "#fca5a5", hex: "#ef4444" },
+  reply:  { label: "回答",   color: "#15803d", bg: "#f0fdf4", border: "#86efac", hex: "#22c55e" },
+  review: { label: "再評価", color: "#92400e", bg: "#fffbeb", border: "#fcd34d", hex: "#f59e0b" },
+  close:  { label: "確定",   color: "#475569", bg: "#f8fafc", border: "#cbd5e1", hex: "#94a3b8" },
+};
+const RC: Record<string, { icon: string; accent: string }> = {
+  "評価者": { icon: "◈", accent: "#1e3a8a" },
+  "PJMO":   { icon: "◇", accent: "#166534" },
+  "AI":     { icon: "◆", accent: "#6b21a8" },
+};
+const NAV: { key: View; icon: string; label: string }[] = [
+  { key: "dashboard", icon: "▦", label: "ダッシュボード" },
+  { key: "rally",     icon: "⇄", label: "レビューラリー" },
+  { key: "ai",        icon: "◈", label: "AI自動レビュー" },
+  { key: "audit",     icon: "≡", label: "監査ログ" },
+  { key: "webhook",   icon: "⬡", label: "通知履歴" },
+];
+
+const S: Record<string, React.CSSProperties> = {
+  input: { padding: "7px 10px", border: "1px solid #e2e8f0", borderRadius: 6,
+           fontSize: 13, fontFamily: "'Noto Sans JP',sans-serif", background: "#fafafa" },
+};
+
+function Badge({ s }: { s: Status }) {
+  const c = SC[s];
+  return (
+    <span style={{ fontSize: 10, fontWeight: 700, color: c.color, background: c.bg,
+                   border: `1px solid ${c.border}`, borderRadius: 4,
+                   padding: "1px 7px", fontFamily: "monospace", letterSpacing: 0.5 }}>{c.label}</span>
+  );
+}
+
+function KpiCard({ label, value, color, sub }: { label: string; value: number | string; color: string; sub?: string }) {
+  return (
+    <div style={{ background: "#fff", borderRadius: 10, padding: "18px 20px",
+                  boxShadow: "0 1px 3px rgba(0,0,0,0.07)",
+                  borderTop: `3px solid ${color}`, flex: 1, minWidth: 130 }}>
+      <div style={{ fontSize: 11, color: "#94a3b8", fontWeight: 700, letterSpacing: 0.5, marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 28, fontWeight: 800, color, fontFamily: "monospace", lineHeight: 1 }}>{value}</div>
+      {sub && <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 4 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function MiniBar({ label, count, total, color }: { label: string; count: number; total: number; color: string }) {
+  const pct = total > 0 ? Math.round(count / total * 100) : 0;
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 3 }}>
+        <span style={{ color: "#475569" }}>{label}</span>
+        <span style={{ fontFamily: "monospace", color, fontWeight: 700 }}>{count}件 ({pct}%)</span>
+      </div>
+      <div style={{ height: 6, background: "#f1f5f9", borderRadius: 3, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${pct}%`, background: color, borderRadius: 3, transition: "width 0.6s ease" }} />
+      </div>
+    </div>
+  );
+}
+
+function LogEntry({ log, canConfirm, canNotify, onClose, onConfirm, onNotify }: {
+  log: ReviewLog; canConfirm: boolean; canNotify: boolean;
+  onClose(id: number): void; onConfirm(id: number): void; onNotify(id: number): void;
+}) {
+  const sc = SC[log.status] ?? SC.issue;
+  const rc = RC[log.role] ?? { icon: "○", accent: "#64748b" };
+  return (
+    <div style={{ borderLeft: `3px solid ${rc.accent}`, background: sc.bg,
+                  borderRadius: "0 8px 8px 0", padding: "13px 16px", marginBottom: 8,
+                  position: "relative", boxShadow: "0 1px 2px rgba(0,0,0,0.05)",
+                  opacity: log.status === "close" ? 0.6 : 1, transition: "opacity 0.2s" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 7, flexWrap: "wrap" }}>
+        <span style={{ color: rc.accent, fontSize: 16, fontFamily: "monospace" }}>{rc.icon}</span>
+        <span style={{ fontWeight: 700, color: rc.accent, fontSize: 13 }}>{log.role}</span>
+        <span style={{ fontSize: 12, color: "#94a3b8" }}>{log.author}</span>
+        <span style={{ fontFamily: "monospace", fontSize: 10, color: "#94a3b8",
+                       background: "#f1f5f9", border: "1px solid #e2e8f0",
+                       borderRadius: 3, padding: "1px 5px" }}>v{log.version}</span>
+        <div style={{ marginLeft: "auto", display: "flex", gap: 5, alignItems: "center" }}>
+          <Badge s={log.status} />
+          <span style={{ fontSize: 10, color: "#94a3b8", fontFamily: "monospace" }}>{log.created_at}</span>
+        </div>
+      </div>
+      <p style={{ margin: 0, fontSize: 13.5, lineHeight: 1.75, color: "#1e293b", whiteSpace: "pre-wrap" }}>{log.comment}</p>
+      {log.confirmed_by && (
+        <div style={{ marginTop: 7, fontSize: 11, color: "#64748b" }}>
+          ✓ {log.confirmed_by} が確定（{log.confirmed_at}）
+        </div>
+      )}
+      {log.status !== "close" && (
+        <div style={{ position: "absolute", top: 10, right: 10, display: "flex", gap: 4 }}>
+          {canNotify  && <Btn color="#0ea5e9" title="通知" onClick={() => onNotify(log.id)}>📡</Btn>}
+          {canConfirm && <Btn color="#16a34a" title="確定" onClick={() => onConfirm(log.id)}>✓</Btn>}
+          <Btn color="#94a3b8" title="クローズ" onClick={() => onClose(log.id)}>✕</Btn>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Btn({ color, title, onClick, children }: React.PropsWithChildren<{ color: string; title?: string; onClick(): void }>) {
+  return (
+    <button onClick={onClick} title={title} style={{ background: "none", border: `1px solid ${color}`,
+      borderRadius: 4, cursor: "pointer", color, fontSize: 11, padding: "2px 6px", fontWeight: 700 }}>
+      {children}
+    </button>
+  );
+}
+
+function FormRow({ label, children, flex }: React.PropsWithChildren<{ label: string; flex?: number }>) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 3, flex }}>
+      <label style={{ fontSize: 10, color: "#94a3b8", fontWeight: 700, letterSpacing: 0.5 }}>{label}</label>
+      {children}
+    </div>
+  );
+}
+
+function Dashboard({ logs, onNav }: { logs: ReviewLog[]; onNav(v: View): void }) {
+  const total = logs.length;
+  const issue  = logs.filter(l => l.status === "issue").length;
+  const reply  = logs.filter(l => l.status === "reply").length;
+  const review = logs.filter(l => l.status === "review").length;
+  const closed = logs.filter(l => l.status === "close").length;
+  const open   = total - closed;
+  const closeRate = total > 0 ? Math.round(closed / total * 100) : 0;
+  const maxVer = logs.length > 0 ? Math.max(...logs.map(l => l.version)) : 0;
+  const recent = [...logs].reverse().slice(0, 5);
+
+  return (
+    <div>
+      <h2 style={{ fontSize: 15, fontWeight: 700, color: "#0f172a", margin: "0 0 18px" }}>ダッシュボード</h2>
+      <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
+        <KpiCard label="総スレッド"    value={total}        color="#475569" />
+        <KpiCard label="未解決指摘"    value={issue}        color="#ef4444" sub="対応が必要" />
+        <KpiCard label="オープン"      value={open}         color="#f59e0b" />
+        <KpiCard label="確定済み"      value={closed}       color="#22c55e" sub={`${closeRate}% 完了`} />
+        <KpiCard label="最新バージョン" value={`v${maxVer}`} color="#6366f1" />
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
+        <div style={{ background: "#fff", borderRadius: 10, padding: "18px 20px", boxShadow: "0 1px 3px rgba(0,0,0,0.07)" }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#475569", marginBottom: 14 }}>種別分布</div>
+          <MiniBar label="指摘 (issue)"    count={issue}  total={total} color="#ef4444" />
+          <MiniBar label="回答 (reply)"    count={reply}  total={total} color="#22c55e" />
+          <MiniBar label="再評価 (review)" count={review} total={total} color="#f59e0b" />
+          <MiniBar label="確定 (close)"    count={closed} total={total} color="#94a3b8" />
+        </div>
+        <div style={{ background: "#fff", borderRadius: 10, padding: "18px 20px", boxShadow: "0 1px 3px rgba(0,0,0,0.07)" }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#475569", marginBottom: 14 }}>処理状況</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 24, justifyContent: "center", padding: "8px 0" }}>
+            <div style={{ position: "relative", width: 100, height: 100 }}>
+              <svg viewBox="0 0 36 36" style={{ transform: "rotate(-90deg)", width: 100, height: 100 }}>
+                <circle cx="18" cy="18" r="15.9" fill="none" stroke="#f1f5f9" strokeWidth="3.5" />
+                {total > 0 && (
+                  <circle cx="18" cy="18" r="15.9" fill="none" stroke="#22c55e" strokeWidth="3.5"
+                    strokeDasharray={`${closeRate} ${100 - closeRate}`} strokeLinecap="round" />
+                )}
+              </svg>
+              <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column",
+                            alignItems: "center", justifyContent: "center" }}>
+                <span style={{ fontSize: 20, fontWeight: 800, color: "#0f172a", fontFamily: "monospace" }}>{closeRate}%</span>
+                <span style={{ fontSize: 9, color: "#94a3b8" }}>完了率</span>
+              </div>
+            </div>
+            <div style={{ fontSize: 12 }}>
+              {([["確定済み", closed, "#22c55e"], ["未対応", open, "#f59e0b"]] as const).map(([l, v, c]) => (
+                <div key={l} style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 6 }}>
+                  <span style={{ width: 10, height: 10, borderRadius: "50%", background: c, display: "inline-block" }} />
+                  <span style={{ color: "#475569" }}>{l}</span>
+                  <span style={{ fontWeight: 700, color: c, fontFamily: "monospace", marginLeft: "auto" }}>{v}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style={{ background: "#fff", borderRadius: 10, padding: "18px 20px", boxShadow: "0 1px 3px rgba(0,0,0,0.07)" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: "#475569" }}>直近アクティビティ（5件）</span>
+          <button onClick={() => onNav("rally")} style={{ background: "none", border: "1px solid #e2e8f0",
+            borderRadius: 5, fontSize: 11, color: "#64748b", padding: "3px 10px", cursor: "pointer" }}>
+            すべて表示 →
+          </button>
+        </div>
+        {recent.length === 0
+          ? <div style={{ textAlign: "center", color: "#94a3b8", padding: 20, fontSize: 13 }}>データなし</div>
+          : recent.map(log => {
+              const rc2 = RC[log.role] ?? { icon: "○", accent: "#64748b" };
+              return (
+                <div key={log.id} style={{ display: "flex", alignItems: "flex-start", gap: 10,
+                                           padding: "9px 0", borderBottom: "1px solid #f8fafc" }}>
+                  <span style={{ color: rc2.accent, fontFamily: "monospace", fontSize: 15, marginTop: 1 }}>{rc2.icon}</span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 2 }}>
+                      <span style={{ fontSize: 12, fontWeight: 700, color: rc2.accent }}>{log.role}</span>
+                      <span style={{ fontSize: 11, color: "#94a3b8" }}>{log.author}</span>
+                      <Badge s={log.status} />
+                      <span style={{ fontSize: 10, color: "#94a3b8", marginLeft: "auto", fontFamily: "monospace" }}>{log.created_at}</span>
+                    </div>
+                    <p style={{ margin: 0, fontSize: 12, color: "#475569", overflow: "hidden",
+                                textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{log.comment}</p>
+                  </div>
+                </div>
+              );
+            })}
+      </div>
+    </div>
+  );
+}
+
+export default function App() {
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [projectId, setProjectId] = useState(1);
+  const [logs, setLogs]   = useState<ReviewLog[]>([]);
+  const [audit, setAudit] = useState<AuditEntry[]>([]);
+  const [hooks, setHooks] = useState<WebhookLog[]>([]);
+  const [view, setView]   = useState<View>("dashboard");
+  const [comment, setComment] = useState("");
+  const [author, setAuthor]   = useState("山田主任");
+  const [role,   setRole]     = useState("PJMO");
+  const [status, setStatus]   = useState<Status>("reply");
+  const [aiText, setAiText]   = useState("");
+  const [loading, setLoading]     = useState(false);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [currentRole, setCurrentRole] = useState<UserRole>("pjmo");
+  const [toast, setToast]   = useState<string | null>(null);
+  const [sideOpen, setSideOpen] = useState(true);
+
+  const canConfirm = currentRole === "admin" || currentRole === "evaluator";
+  const canExport  = currentRole === "admin" || currentRole === "evaluator";
+  const canNotify  = currentRole === "admin" || currentRole === "pjmo";
+
+  const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 3000); };
+  const headers = () => ({ "X-User-Name": author, "X-User-Role": currentRole });
+
+  const loadProjects = useCallback(() => {
+    fetch(`${API}/projects/`).then(r => r.json()).then(setProjects).catch(console.error);
+  }, []);
+  const loadLogs = useCallback(() => {
+    fetch(`${API}/review/${projectId}`, { headers: headers() })
+      .then(r => r.json()).then(setLogs).catch(console.error);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, currentRole]);
+  const loadAudit = useCallback(() => {
+    fetch(`${API}/review/${projectId}/audit`, { headers: headers() })
+      .then(r => r.json()).then(setAudit).catch(console.error);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, currentRole]);
+  const loadHooks = useCallback(() => {
+    fetch(`${API}/notify/logs/${projectId}`, { headers: headers() })
+      .then(r => r.json()).then(setHooks).catch(console.error);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, currentRole]);
+
+  useEffect(() => { loadProjects(); }, [loadProjects]);
+  useEffect(() => { loadLogs(); }, [loadLogs]);
+  useEffect(() => { if (view === "audit")   loadAudit(); }, [view, loadAudit]);
+  useEffect(() => { if (view === "webhook") loadHooks(); }, [view, loadHooks]);
+
+  const sendComment = () => {
+    if (!comment.trim()) return;
+    setLoading(true);
+    fetch(`${API}/review/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers() },
+      body: JSON.stringify({ project_id: projectId, author, role, comment, status }),
+    }).then(() => { setComment(""); loadLogs(); showToast("送信しました"); })
+      .finally(() => setLoading(false));
+  };
+  const closeLog = (id: number) => {
+    fetch(`${API}/review/${id}`, { method: "DELETE", headers: headers() })
+      .then(() => { loadLogs(); showToast("クローズしました"); });
+  };
+  const confirmLog = (id: number) => {
+    fetch(`${API}/review/${id}/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers() },
+      body: JSON.stringify({ confirmed_by: author }),
+    }).then(() => { loadLogs(); showToast("評価を確定しました"); });
+  };
+  const notifyLog = (id: number) => {
+    fetch(`${API}/notify/review/${id}`, {
+      method: "POST", headers: { "Content-Type": "application/json", ...headers() },
+    }).then(() => showToast("通知を送信しました（Agent Card形式）"));
+  };
+  const sendAi = () => {
+    if (!aiText.trim()) return;
+    setAiLoading(true);
+    fetch(`${API}/review/auto`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers() },
+      body: JSON.stringify({ project_id: projectId, text: aiText }),
+    })
+      .then(r => r.json())
+      .then(() => { setAiText(""); setView("rally"); loadLogs(); showToast("AIレビューを登録しました"); })
+      .catch(e => alert("AI APIエラー: " + e.message))
+      .finally(() => setAiLoading(false));
+  };
+  const exportFile = (type: "excel" | "pdf") => {
+    fetch(`${API}/export/${projectId}/${type}`, { headers: headers() })
+      .then(r => { if (!r.ok) throw new Error("エクスポートエラー"); return r.blob(); })
+      .then(blob => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `review_pj${projectId}.${type === "excel" ? "xlsx" : "pdf"}`;
+        a.click();
+        URL.revokeObjectURL(url);
+        showToast(`${type.toUpperCase()} をダウンロードしました`);
+      }).catch(e => alert(e.message));
+  };
+
+  const issueCount = logs.filter(l => l.status === "issue").length;
+  const currentProject = projects.find(p => p.id === projectId);
+
+  return (
+    <div style={{ display: "flex", minHeight: "100vh", background: "#f1f5f9", fontFamily: "'Noto Sans JP',sans-serif" }}>
+      {toast && (
+        <div style={{ position: "fixed", top: 20, right: 20, zIndex: 9999, background: "#0f172a", color: "#fff",
+                      padding: "10px 20px", borderRadius: 8, fontSize: 13, boxShadow: "0 4px 12px rgba(0,0,0,0.3)" }}>
+          {toast}
+        </div>
+      )}
+      <aside style={{ width: sideOpen ? 200 : 52, transition: "width 0.25s ease", background: "#0f172a",
+                      display: "flex", flexDirection: "column", flexShrink: 0, overflow: "hidden" }}>
+        <div style={{ height: 54, display: "flex", alignItems: "center",
+                      padding: sideOpen ? "0 16px" : "0 14px", gap: 10, borderBottom: "1px solid #1e293b" }}>
+          <span style={{ fontFamily: "monospace", fontSize: 13, color: "#60a5fa", fontWeight: 700, letterSpacing: 2, flexShrink: 0 }}>▦</span>
+          {sideOpen && <span style={{ fontSize: 12, fontWeight: 700, color: "#e2e8f0", whiteSpace: "nowrap" }}>PJMO Review</span>}
+          <button onClick={() => setSideOpen(v => !v)}
+            style={{ marginLeft: "auto", background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 16, padding: 0, flexShrink: 0 }}>
+            {sideOpen ? "◀" : "▶"}
+          </button>
+        </div>
+        <nav style={{ padding: "12px 0", flex: 1 }}>
+          {NAV.map(n => (
+            <button key={n.key} onClick={() => setView(n.key)}
+              style={{ display: "flex", alignItems: "center", gap: 10, width: "100%",
+                       padding: sideOpen ? "9px 16px" : "9px 14px",
+                       background: view === n.key ? "#1e293b" : "none", border: "none", cursor: "pointer",
+                       borderLeft: view === n.key ? "3px solid #60a5fa" : "3px solid transparent",
+                       color: view === n.key ? "#e2e8f0" : "#64748b",
+                       fontSize: 13, fontFamily: "'Noto Sans JP',sans-serif",
+                       transition: "all 0.15s", textAlign: "left" }}>
+              <span style={{ fontFamily: "monospace", fontSize: 14, flexShrink: 0 }}>{n.icon}</span>
+              {sideOpen && <span style={{ whiteSpace: "nowrap", fontSize: 12 }}>{n.label}</span>}
+            </button>
+          ))}
+        </nav>
+        {sideOpen && (
+          <div style={{ padding: "12px 14px", borderTop: "1px solid #1e293b" }}>
+            <div style={{ fontSize: 10, color: "#475569", marginBottom: 5, fontWeight: 700 }}>ROLE（開発用）</div>
+            <select value={currentRole} onChange={e => setCurrentRole(e.target.value as UserRole)}
+              style={{ width: "100%", fontSize: 11, padding: "4px 6px", borderRadius: 4,
+                       border: "1px solid #334155", background: "#1e293b", color: "#e2e8f0",
+                       fontFamily: "'Noto Sans JP',sans-serif" }}>
+              <option value="admin">管理者</option>
+              <option value="evaluator">評価者</option>
+              <option value="pjmo">PJMO</option>
+              <option value="viewer">閲覧者</option>
+            </select>
+          </div>
+        )}
+      </aside>
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <header style={{ height: 54, background: "#fff", borderBottom: "1px solid #e2e8f0",
+                         display: "flex", alignItems: "center", padding: "0 20px", gap: 14,
+                         boxShadow: "0 1px 2px rgba(0,0,0,0.04)" }}>
+          <select value={projectId} onChange={e => setProjectId(Number(e.target.value))}
+            style={{ ...S.input, minWidth: 240, fontSize: 13 }}>
+            {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+          {currentProject && <span style={{ fontSize: 11, color: "#94a3b8" }}>{currentProject.description}</span>}
+          <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
+            {issueCount > 0 && (
+              <span style={{ background: "#dc2626", color: "#fff", borderRadius: 12,
+                             padding: "2px 10px", fontSize: 11, fontWeight: 700 }}>
+                ⚠ 未解決指摘 {issueCount}件
+              </span>
+            )}
+            {canExport && (<>
+              <button onClick={() => exportFile("excel")} style={exportBtn("#16a34a")}>↓ Excel</button>
+              <button onClick={() => exportFile("pdf")}   style={exportBtn("#dc2626")}>↓ PDF</button>
+            </>)}
+          </div>
+        </header>
+        <main style={{ flex: 1, overflowY: "auto", padding: 24 }}>
+          {view === "dashboard" && <Dashboard logs={logs} onNav={setView} />}
+          {view === "rally" && (
+            <div>
+              <h2 style={h2}>レビューラリー</h2>
+              <div style={card}>
+                {logs.length === 0
+                  ? <div style={empty}>レビュー履歴がありません</div>
+                  : logs.map(log => (
+                      <LogEntry key={log.id} log={log}
+                        canConfirm={canConfirm} canNotify={canNotify}
+                        onClose={closeLog} onConfirm={confirmLog} onNotify={notifyLog} />
+                    ))}
+                <div style={{ borderTop: "1px solid #f1f5f9", paddingTop: 18, marginTop: 8 }}>
+                  <div style={{ display: "flex", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
+                    <FormRow label="氏名" flex={1}><input value={author} onChange={e => setAuthor(e.target.value)} style={{ ...S.input, minWidth: 100 }} /></FormRow>
+                    <FormRow label="役割"><select value={role} onChange={e => setRole(e.target.value)} style={S.input}><option value="PJMO">PJMO</option><option value="評価者">評価者</option></select></FormRow>
+                    <FormRow label="種別"><select value={status} onChange={e => setStatus(e.target.value as Status)} style={S.input}><option value="issue">指摘</option><option value="reply">回答</option><option value="review">再評価</option><option value="close">確定</option></select></FormRow>
+                  </div>
+                  <textarea value={comment} onChange={e => setComment(e.target.value)}
+                    placeholder="コメントを入力..." rows={4}
+                    style={{ ...S.input, width: "100%", resize: "vertical", lineHeight: 1.6, boxSizing: "border-box", marginBottom: 10 }} />
+                  <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                    <button onClick={sendComment} disabled={loading || !comment.trim()} style={primaryBtn(loading || !comment.trim())}>
+                      {loading ? "送信中..." : "送信"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+          {view === "ai" && (
+            <div>
+              <h2 style={h2}>AI自動レビュー</h2>
+              <div style={card}>
+                <p style={{ fontSize: 13, color: "#475569", lineHeight: 1.75, margin: "0 0 14px" }}>
+                  調達仕様書・見積書のテキストを貼り付けると、DS-110/DS-910の観点からClaudeが自動レビューし、
+                  指摘事項をラリーに登録します。
+                </p>
+                <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 6,
+                              padding: "9px 14px", marginBottom: 14, fontSize: 11, color: "#92400e" }}>
+                  ⚠ docker-compose の ollama サービスが起動している必要があります（モデル変更: OLLAMA_MODEL 環境変数）
+                </div>
+                <textarea value={aiText} onChange={e => setAiText(e.target.value)}
+                  placeholder="調達仕様書・見積書・要件定義書等を貼り付けてください" rows={10}
+                  style={{ ...S.input, width: "100%", resize: "vertical", lineHeight: 1.6, boxSizing: "border-box", marginBottom: 12 }} />
+                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                  <button onClick={sendAi} disabled={aiLoading || !aiText.trim()}
+                    style={{ ...primaryBtn(aiLoading || !aiText.trim()), background: aiLoading || !aiText.trim() ? "#cbd5e1" : "#7c3aed" }}>
+                    {aiLoading ? "AIレビュー中..." : "🤖 AIレビュー実行"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+          {view === "audit" && (
+            <div>
+              <h2 style={h2}>監査ログ</h2>
+              <div style={card}>
+                <p style={{ fontSize: 12, color: "#64748b", margin: "0 0 16px" }}>全操作の記録（直近100件）</p>
+                {audit.length === 0
+                  ? <div style={empty}>ログなし</div>
+                  : <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                      <thead>
+                        <tr style={{ background: "#f8fafc" }}>
+                          {["日時", "ユーザー", "操作", "対象テーブル", "対象ID"].map(h => (
+                            <th key={h} style={{ padding: "8px 10px", textAlign: "left",
+                                                 borderBottom: "2px solid #e2e8f0", fontWeight: 700, color: "#475569" }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {audit.map((a, i) => (
+                          <tr key={i} style={{ borderBottom: "1px solid #f1f5f9" }}>
+                            <td style={td}><span style={{ fontFamily: "monospace", fontSize: 11 }}>{a.created_at}</span></td>
+                            <td style={td}>{a.user_name}</td>
+                            <td style={td}><code style={{ background: "#f1f5f9", padding: "1px 6px", borderRadius: 3, fontSize: 11 }}>{a.action}</code></td>
+                            <td style={td}>{a.target_table}</td>
+                            <td style={td}>{a.target_id}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                }
+              </div>
+            </div>
+          )}
+          {view === "webhook" && (
+            <div>
+              <h2 style={h2}>通知履歴（MCP/Webhook）</h2>
+              <div style={card}>
+                <p style={{ fontSize: 12, color: "#64748b", margin: "0 0 16px" }}>
+                  Agent Card形式（JSON-LD）でのWebhook送信履歴
+                </p>
+                {hooks.length === 0
+                  ? <div style={empty}>送信履歴なし（ラリー画面の 📡 ボタンで送信できます）</div>
+                  : <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                      <thead>
+                        <tr style={{ background: "#f8fafc" }}>
+                          {["ID", "イベント", "ステータス", "作成日時", "送信日時"].map(h => (
+                            <th key={h} style={{ padding: "8px 10px", textAlign: "left",
+                                                 borderBottom: "2px solid #e2e8f0", fontWeight: 700, color: "#475569" }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {hooks.map(w => (
+                          <tr key={w.id} style={{ borderBottom: "1px solid #f1f5f9" }}>
+                            <td style={td}>{w.id}</td>
+                            <td style={td}><code style={{ background: "#f0fdf4", padding: "1px 6px", borderRadius: 3, fontSize: 11 }}>{w.event_type}</code></td>
+                            <td style={td}><span style={{ color: w.status === "sent" ? "#16a34a" : "#dc2626", fontWeight: 700, fontSize: 11 }}>{w.status}</span></td>
+                            <td style={td}><span style={{ fontFamily: "monospace", fontSize: 11 }}>{w.created_at}</span></td>
+                            <td style={td}><span style={{ fontFamily: "monospace", fontSize: 11 }}>{w.sent_at ?? "—"}</span></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                }
+              </div>
+            </div>
+          )}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+const h2: React.CSSProperties = { fontSize: 15, fontWeight: 700, color: "#0f172a", margin: "0 0 16px" };
+const card: React.CSSProperties = { background: "#fff", borderRadius: 10, padding: "22px", boxShadow: "0 1px 3px rgba(0,0,0,0.07)" };
+const empty: React.CSSProperties = { textAlign: "center", color: "#94a3b8", padding: "36px 0", fontSize: 14 };
+const td: React.CSSProperties = { padding: "8px 10px", color: "#334155" };
+const primaryBtn = (disabled: boolean): React.CSSProperties => ({
+  background: disabled ? "#cbd5e1" : "#0f172a", color: "#fff", border: "none", borderRadius: 6,
+  padding: "9px 24px", fontSize: 13, fontWeight: 700,
+  cursor: disabled ? "not-allowed" : "pointer", fontFamily: "'Noto Sans JP',sans-serif",
+});
+const exportBtn = (color: string): React.CSSProperties => ({
+  background: "none", border: `1px solid ${color}`, color, borderRadius: 5,
+  padding: "5px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer",
+  fontFamily: "'Noto Sans JP',sans-serif",
+});
+#+end_src
+
+* インフラ
+
+** docker-compose.yml（開発環境）
+
+#+begin_src yaml :tangle docker-compose.yml
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: budget
+      POSTGRES_PASSWORD: budget
+      POSTGRES_DB: budget
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U budget"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://budget:budget@db:5432/budget
+      # RBAC: Keycloak連携時はここにJWKS URLを設定
+      # KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/pjmo/protocol/openid-connect/certs
+      # AI自動レビュー（Ollama）
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: qwen2.5
+      # Webhook通知先（Slack/Teams/カスタム）
+      # WEBHOOK_URL: https://hooks.slack.com/services/xxx
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    volumes:
+      - ./backend:/app
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: development
+    ports:
+      - "3005:3005"
+    environment:
+      REACT_APP_API_URL: http://localhost:8000
+    depends_on:
+      - backend
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  # Keycloak RBAC（オプション）
+  # keycloak:
+  #   image: quay.io/keycloak/keycloak:24.0
+  #   environment:
+  #     KEYCLOAK_ADMIN: admin
+  #     KEYCLOAK_ADMIN_PASSWORD: admin
+  #   command: start-dev
+  #   ports:
+  #     - "8080:8080"
+  #   depends_on:
+  #     db:
+  #       condition: service_healthy
+
+volumes:
+  pgdata:
+  ollama_data:
+#+end_src
+
+** docker-compose.prod.yml（本番環境）
+
+#+begin_src yaml :tangle docker-compose.prod.yml
+services:
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER:-budget}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD required}
+      POSTGRES_DB: ${DB_NAME:-budget}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-budget}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: always
+    expose:
+      - "8000"
+    environment:
+      DATABASE_URL: postgresql://${DB_USER:-budget}:${DB_PASSWORD}@db:5432/${DB_NAME:-budget}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: production
+      args:
+        REACT_APP_API_URL: /api
+    restart: always
+    expose:
+      - "80"
+    depends_on:
+      - backend
+
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - frontend
+      - backend
+
+volumes:
+  pgdata:
+#+end_src
+
+** nginx/Dockerfile
+
+#+begin_src dockerfile :tangle nginx/Dockerfile
+FROM nginx:1.27-alpine
+RUN rm /etc/nginx/conf.d/default.conf
+COPY nginx.conf /etc/nginx/nginx.conf
+EXPOSE 80 443
+#+end_src
+
+** nginx/nginx.conf
+
+#+begin_src nginx :tangle nginx/nginx.conf
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events { worker_connections 1024; }
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    sendfile on;
+    keepalive_timeout 65;
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript;
+
+    server {
+        listen 80;
+        server_name _;
+        return 301 https://$host$request_uri;
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name _;
+
+        ssl_certificate     /etc/nginx/certs/server.crt;
+        ssl_certificate_key /etc/nginx/certs/server.key;
+        ssl_protocols       TLSv1.2 TLSv1.3;
+        ssl_ciphers         HIGH:!aNULL:!MD5;
+
+        add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+        add_header X-Frame-Options DENY always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+        location / {
+            root /usr/share/nginx/html;
+            index index.html;
+            try_files $uri $uri/ /index.html;
+            location ~* \.(js|css|png|jpg|ico|svg|woff2?)$ {
+                expires 1y;
+                add_header Cache-Control "public, immutable";
+            }
+        }
+
+        location /api/ {
+            proxy_pass         http://backend:8000/;
+            proxy_http_version 1.1;
+            proxy_set_header   Host $host;
+            proxy_set_header   X-Real-IP $remote_addr;
+            proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_read_timeout 60s;
+            client_max_body_size 10m;
+        }
+
+        location /healthz {
+            access_log off;
+            return 200 "ok\n";
+            add_header Content-Type text/plain;
+        }
+    }
+}
+#+end_src
+
+** nginx/gen-cert.sh
+
+#+begin_src shell :tangle nginx/gen-cert.sh :shebang "#!/bin/bash"
+set -e
+CERT_DIR="$(dirname "$0")/certs"
+mkdir -p "$CERT_DIR"
+if [ -f "$CERT_DIR/server.crt" ]; then
+  echo "証明書が既に存在します: $CERT_DIR/server.crt"
+  exit 0
+fi
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout "$CERT_DIR/server.key" \
+  -out "$CERT_DIR/server.crt" \
+  -subj "/C=JP/ST=Tokyo/L=Chiyoda/O=PJMO/CN=pjmo-review.local" \
+  -addext "subjectAltName=DNS:pjmo-review.local,DNS:localhost,IP:127.0.0.1"
+chmod 600 "$CERT_DIR/server.key"
+echo "完了: $CERT_DIR/"
+#+end_src
+
+** .env.prod.example
+
+#+begin_src text :tangle .env.prod.example
+# ────────────────────────────────────────────────
+# 本番環境変数テンプレート
+# cp .env.prod.example .env.prod して値を設定
+# .env.prod は .gitignore に必ず追加すること
+# ────────────────────────────────────────────────
+
+# PostgreSQL
+DB_USER=budget
+DB_PASSWORD=CHANGE_ME_STRONG_PASSWORD
+DB_NAME=budget
+
+# Claude API（AI自動レビュー機能）
+OLLAMA_URL=http://ollama:11434
+OLLAMA_MODEL=qwen2.5
+
+# Webhook通知先（Slack / Teams / カスタム）
+# WEBHOOK_URL=https://hooks.slack.com/services/T00000000/B00000000/xxxxxxxx
+#+end_src
+
+** .gitignore
+
+#+begin_src text :tangle .gitignore
+.env.prod
+.env.local
+nginx/certs/
+__pycache__/
+*.pyc
+node_modules/
+frontend/build/
+frontend/dist/
+.docker/
+.vscode/
+.idea/
+*.swp
+#+end_src
+
+* 起動・運用手順
+
+** 開発環境
+
+#+begin_src shell :eval no
+docker compose build --no-cache
+docker compose up
+# → http://localhost:3005  （フロントエンド）
+# → http://localhost:8000/docs （Swagger UI）
+#+end_src
+
+
+** Ollama モデル管理
+
+*** 初回セットアップ（モデルのpull）
+
+起動後、別ターミナルでモデルをダウンロードする（初回のみ）。
+
+#+begin_src shell :eval no
+# デフォルトモデル（約2GB）
+docker compose exec ollama ollama pull qwen2.5
+
+# pullの進捗確認
+docker compose exec ollama ollama list
+#+end_src
+
+*** モデルの変更
+
+=docker-compose.yml= の =OLLAMA_MODEL= 環境変数を変更してコンテナを再起動する。
+
+#+begin_src yaml :eval no
+# docker-compose.yml の backend サービス
+environment:
+  OLLAMA_MODEL: qwen2.5   # ← ここを変更
+#+end_src
+
+推奨モデル一覧:
+
+| モデル | サイズ | 特徴 |
+|--------+--------+------|
+| =qwen2.5= | ~4.7GB | *デフォルト*。日本語対応が強い |
+| =qwen2.5:7b= | ~4.7GB | 7Bパラメータ・バランス型 |
+| =qwen2.5:14b= | ~9GB | 高精度・日本語特化 |
+| =mistral= | ~4.1GB | 汎用高性能 |
+
+#+begin_src shell :eval no
+# モデル変更の手順
+docker compose exec ollama ollama pull qwen2.5:14b  # 別バリアントをpull
+# docker-compose.yml の OLLAMA_MODEL を qwen2.5:14b に変更
+docker compose restart backend
+#+end_src
+
+*** Ollamaの直接操作
+
+#+begin_src shell :eval no
+# インストール済みモデル確認
+docker compose exec ollama ollama list
+
+# モデルの削除
+docker compose exec ollama ollama rm qwen2.5
+
+# モデルの詳細情報
+docker compose exec ollama ollama show qwen2.5
+
+# 動作テスト（コンテナ内から直接）
+docker compose exec ollama ollama run qwen2.5 "DS-110とは何ですか？"
+
+# ホストから直接APIを叩く
+curl http://localhost:11434/api/chat -d '{model:qwen2.5,messages:[{role:user,content:test}],stream:false}'
+#+end_src
+
+** 本番デプロイ
+
+#+begin_src shell :eval no
+bash nginx/gen-cert.sh
+cp .env.prod.example .env.prod && vi .env.prod
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+curl https://your-domain.go.jp/healthz
+#+end_src
+
+** APIエンドポイント
+
+| Method | Path | 権限 | 説明 |
+|--------+------+------+------|
+| GET | ~/projects/~ | read | PJ一覧 |
+| GET | ~/review/{id}~ | read | ログ取得 |
+| POST | ~/review/~ | write | コメント投稿 |
+| POST | ~/review/{id}/confirm~ | confirm | 評価確定 |
+| DELETE | ~/review/{id}~ | write | クローズ |
+| POST | ~/review/auto~ | write | AI自動レビュー |
+| GET | ~/review/{id}/audit~ | confirm | 監査ログ |
+| GET | ~/export/{id}/excel~ | export | Excel出力 |
+| GET | ~/export/{id}/pdf~ | export | PDF出力 |
+| POST | ~/notify/review/{id}~ | write | MCP通知 |
+| GET | ~/notify/logs/{id}~ | read | 通知履歴 |
+
+** バックアップ
+
+#+begin_src shell :eval no
+docker compose exec db pg_dump -U budget budget > backup_$(date +%Y%m%d).sql
+#+end_src
+
+* トラブルシューティング履歴
+
+** フロントエンドビルド問題（解決済み）
+
+=react-scripts 5 + Node 18/20= の組み合わせで発生した =ajv= / =fork-ts-checker-webpack-plugin= の依存関係競合を、*Vite 5 + Node 20* への移行で根本解決した。
+
+| エラー | 原因 | 対処 |
+|--------+------+------|
+| =ajv/dist/compile/codegen= not found | fork-ts-checker が ajv@6 を内包 | Vite 移行 |
+| =Unknown keyword formatMinimum= | ajv-keywords バージョン不整合 | Vite 移行 |
+| =schema_utils_1.default is not a function= | schema-utils バージョン不整合 | Vite 移行 |
+| =port is already allocated= | ホスト側3000番使用中 | ホスト側3005番に変更 |
+| =version obsolete= | docker-compose.yml の version フィールド | 削除 |

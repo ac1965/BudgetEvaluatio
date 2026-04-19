@@ -40,17 +40,20 @@ Internet
 
 ** 実装機能一覧
 
-| 機能                  | 説明                                                    |
-|-----------------------+---------------------------------------------------------|
-| ダッシュボード        | KPIカード・種別分布・完了率ドーナツ・アクティビティ5件  |
-| レビューラリー        | 評価者↔PJMO往復コメント・バージョン管理                 |
-| RBAC                  | admin/evaluator/pjmo/viewer の4ロール権限               |
-| AI自動レビュー        | Claude API による DS-110/DS-910 観点の自動指摘          |
-| 評価確定              | evaluator/admin による確定操作・確定者・日時記録        |
-| 監査ログ              | 全操作を audit_logs テーブルに記録                      |
-| Excel/PDFエクスポート | openpyxl / reportlab による監査ログ出力                 |
-| MCP/Webhook通知       | Agent Card（JSON-LD / schema.org）形式でイベント通知    |
-| 本番デプロイ          | nginx + HTTPS + multi-stage Docker build                |
+| 機能                        | 説明                                                      |
+|-----------------------------+-----------------------------------------------------------|
+| ダッシュボード              | KPIカード・種別分布・完了率ドーナツ・アクティビティ5件    |
+| レビューラリー              | 評価者↔PJMO往復コメント・バージョン管理                   |
+| RBAC                        | admin/evaluator/pjmo/viewer の4ロール権限                 |
+| AI自動レビュー              | Claude API による DS-110/DS-910 観点の自動指摘            |
+| 評価確定                    | evaluator/admin による確定操作・確定者・日時記録          |
+| 監査ログ                    | 全操作を audit_logs テーブルに記録                        |
+| Excel/PDFエクスポート       | openpyxl / reportlab による監査ログ出力                   |
+| システム管理（CRUD）        | システムの追加・編集・*削除* （事業0件時のみ削除可）      |
+| システムJSON入出力          | システム単位の設定・事業・ラリー履歴を JSON で 出力／取込 |
+| リレーデータ入出力          | 事業単位で review_threads + review_entries のみを入出力   |
+| MCP/Webhook通知             | Agent Card（JSON-LD / schema.org）形式でイベント通知      |
+| 本番デプロイ                | nginx + HTTPS + multi-stage Docker build                  |
 
 ** ディレクトリ構成
 
@@ -532,28 +535,6 @@ python org_tangle.py --out /tmp/pjmo-out
       target_id    INT,
       detail       JSONB,
       created_at   TIMESTAMP DEFAULT now()
-  );
-
-  -- init.sql
-  CREATE TABLE IF NOT EXISTS systems (
-      id SERIAL PRIMARY KEY,
-      name TEXT NOT NULL,
-      department TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-  );
-
-  CREATE TABLE IF NOT EXISTS projects (
-      id SERIAL PRIMARY KEY,
-      system_id INT REFERENCES systems(id),
-      is_system_wide BOOLEAN NOT NULL DEFAULT FALSE,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-  );
-
-  CREATE TABLE IF NOT EXISTS review_threads (
-      id SERIAL PRIMARY KEY,
-      project_id INT REFERENCES projects(id),
-      status TEXT NOT NULL DEFAULT 'open',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   );
 
   -- ════════════════════════════════════════════════════════
@@ -2254,6 +2235,122 @@ def import_system_json(payload: dict, db: Session = Depends(get_db),
 
     db.commit()
     return {"status": "ok", "system_id": system_id}
+
+
+# ════════════════════════════════════════════════════════
+#  リレーデータ（レビューラリー）単独エクスポート/インポート
+#  - 事業（project）単位で review_threads + review_entries のみを入出力する
+#  - 目的：他環境とのレビュー履歴共有・バックアップ復元
+# ════════════════════════════════════════════════════════
+
+@router.get("/export/project/{project_id}/relay")
+def export_project_relay(project_id: int, db: Session = Depends(get_db),
+                         user: UserContext = Depends(get_current_user)):
+    """指定事業の「レビューラリー」履歴（threads + entries）のみをJSONで出力"""
+    user.require("export")
+
+    pj = db.execute(
+        text("SELECT id, name, system_id FROM projects WHERE id=:id"),
+        {"id": project_id}
+    ).fetchone()
+    if not pj:
+        raise HTTPException(404, "事業が見つかりません")
+
+    threads = db.execute(text("""
+        SELECT id, thread_no, title, status, due_date::text
+        FROM review_threads WHERE project_id=:p ORDER BY thread_no
+    """), {"p": project_id}).fetchall()
+
+    result_threads = []
+    for t in threads:
+        entries = db.execute(text("""
+            SELECT seq, entry_type, role, comment, entry_date::text
+            FROM review_entries WHERE thread_id=:t ORDER BY seq
+        """), {"t": t.id}).fetchall()
+        result_threads.append({
+            "thread_no": t.thread_no,
+            "title": t.title,
+            "status": t.status,
+            "due_date": t.due_date,
+            "entries": [dict(e._mapping) for e in entries],
+        })
+
+    return {
+        "export_version": "1.0",
+        "export_type": "relay",
+        "exported_at": datetime.now().isoformat(),
+        "project": {"id": pj.id, "name": pj.name, "system_id": pj.system_id},
+        "threads": result_threads,
+    }
+
+
+@router.post("/import/project/{project_id}/relay")
+def import_project_relay(project_id: int, payload: dict,
+                         mode: str = "append",
+                         db: Session = Depends(get_db),
+                         user: UserContext = Depends(get_current_user)):
+    """
+    「レビューラリー」履歴のインポート。
+    - mode='append'  : 既存スレッドを残し、thread_no を採番し直して追記
+    - mode='replace' : 事業配下の threads/entries を全削除してから投入
+    """
+    user.require("manage")
+    if payload.get("export_version") != "1.0":
+        raise HTTPException(400, "サポートされていない export_version です")
+    if payload.get("export_type") != "relay":
+        raise HTTPException(400, "リレーデータの形式ではありません")
+    if mode not in ("append", "replace"):
+        raise HTTPException(400, "mode は append または replace を指定してください")
+
+    pj = db.execute(
+        text("SELECT id FROM projects WHERE id=:id"), {"id": project_id}
+    ).fetchone()
+    if not pj:
+        raise HTTPException(404, "事業が見つかりません")
+
+    if mode == "replace":
+        db.execute(text("""
+            DELETE FROM review_entries
+            WHERE thread_id IN (SELECT id FROM review_threads WHERE project_id=:p)
+        """), {"p": project_id})
+        db.execute(text("DELETE FROM review_threads WHERE project_id=:p"),
+                   {"p": project_id})
+
+    # 既存の最大 thread_no を取得（append時の採番用）
+    max_no = db.execute(
+        text("SELECT COALESCE(MAX(thread_no),0) FROM review_threads WHERE project_id=:p"),
+        {"p": project_id}
+    ).scalar() or 0
+
+    imported_threads = 0
+    imported_entries = 0
+    for i, t in enumerate(payload.get("threads", []), start=1):
+        thread_no = (max_no + i) if mode == "append" else t.get("thread_no", i)
+        t_row = db.execute(text("""
+            INSERT INTO review_threads (project_id, thread_no, title, status, due_date)
+            VALUES (:p,:tn,:ti,:st,:dd) RETURNING id
+        """), {"p": project_id, "tn": thread_no, "ti": t.get("title"),
+               "st": t.get("status", "open"), "dd": t.get("due_date")}).fetchone()
+        thread_id = t_row[0]
+        imported_threads += 1
+
+        for e in t.get("entries", []):
+            db.execute(text("""
+                INSERT INTO review_entries (thread_id, seq, entry_type, role, comment, entry_date)
+                VALUES (:t,:s,:et,:r,:c,:ed)
+            """), {"t": thread_id, "s": e.get("seq"), "et": e.get("entry_type"),
+                   "r": e.get("role"), "c": e.get("comment", ""),
+                   "ed": e.get("entry_date")})
+            imported_entries += 1
+
+    db.commit()
+    return {
+        "status": "ok",
+        "mode": mode,
+        "project_id": project_id,
+        "imported_threads": imported_threads,
+        "imported_entries": imported_entries,
+    }
 #+end_src
 
 ** types.ts
@@ -2917,7 +3014,7 @@ root.render(<App />);
 ** src/App.tsx
 
 #+begin_src typescript :tangle frontend/src/App.tsx
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useState, useCallback, useRef } from "react";
 import { View, UserRole, SystemRow, ProjectRow, ThreadRow, EntryRow,
          AuditRow, WebhookRow, THREAD_STATUS, ENTRY_TYPE, ROLE_ICON,
          COST_CATEGORIES } from "./types";
@@ -3056,6 +3153,12 @@ function SystemsView({ headers, showToast }: { headers: () => Record<string, str
   const [newSysDept, setNewSysDept] = useState("");
   const [newPj, setNewPj] = useState({ name: "", cost_category: "", amount_single: "", amount_advance: "", amount_deferred: "", evaluator_name: "" });
 
+  // 削除確認モーダル
+  const [confirmDelete, setConfirmDelete] = useState<SystemRow | null>(null);
+  // インポートモーダル
+  const [showImport, setShowImport] = useState(false);
+  const importFileRef = useRef<HTMLInputElement>(null);
+
   const loadSystems = useCallback(() => {
     fetch(`${API}/systems/`, { headers: headers() }).then(r => r.json()).then(setSystems);
   }, []);
@@ -3091,13 +3194,77 @@ function SystemsView({ headers, showToast }: { headers: () => Record<string, str
     });
   };
 
+  // システム削除
+  const deleteSystem = (sys: SystemRow) => {
+    fetch(`${API}/systems/${sys.id}`, { method: "DELETE", headers: headers() })
+      .then(async r => {
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({ detail: "削除に失敗しました" }));
+          throw new Error(err.detail || "削除に失敗しました");
+        }
+        setConfirmDelete(null);
+        if (expandedSys === sys.id) setExpandedSys(null);
+        loadSystems();
+        showToast(`「${sys.name}」を削除しました`);
+      })
+      .catch((e: Error) => showToast(`削除エラー: ${e.message}`));
+  };
+
+  // システムのエクスポート（JSONダウンロード）
+  const exportSystem = (sys: SystemRow) => {
+    fetch(`${API}/export/system/${sys.id}/json`, { headers: headers() })
+      .then(async r => {
+        if (!r.ok) throw new Error("エクスポートに失敗しました");
+        return r.json();
+      })
+      .then(data => {
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement("a");
+        a.href = url;
+        a.download = `system_${sys.id}_${sys.name}_${new Date().toISOString().slice(0,10)}.json`;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        showToast(`「${sys.name}」をエクスポートしました`);
+      })
+      .catch((e: Error) => showToast(`エクスポートエラー: ${e.message}`));
+  };
+
+  // システムのインポート（JSONファイル選択）
+  const importSystem = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const payload = JSON.parse(String(reader.result));
+        fetch(`${API}/import/system`, { method: "POST",
+          headers: { "Content-Type": "application/json", ...headers() },
+          body: JSON.stringify(payload)
+        }).then(async r => {
+          if (!r.ok) {
+            const err = await r.json().catch(() => ({ detail: "インポートに失敗しました" }));
+            throw new Error(err.detail || "インポートに失敗しました");
+          }
+          setShowImport(false);
+          loadSystems();
+          showToast("システムをインポートしました");
+        }).catch((e: Error) => showToast(`インポートエラー: ${e.message}`));
+      } catch {
+        showToast("JSONの解析に失敗しました");
+      }
+    };
+    reader.readAsText(file);
+  };
+
   const fmtAmount = (n: number) => n > 0 ? `${n.toLocaleString()} 千円` : "—";
 
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
         <h2 style={{ ...S.h2, margin: 0 }}>システム管理</h2>
-        <button onClick={() => setShowNewSys(true)} style={btn("#4338ca")}>＋ システム追加</button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => setShowImport(true)} style={chipBtn()}>📥 インポート</button>
+          <button onClick={() => setShowNewSys(true)} style={btn("#4338ca")}>＋ システム追加</button>
+        </div>
       </div>
 
       {/* 新規システムモーダル */}
@@ -3127,6 +3294,47 @@ function SystemsView({ headers, showToast }: { headers: () => Record<string, str
         </div>
       )}
 
+      {/* 削除確認モーダル */}
+      {confirmDelete && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.4)", zIndex: 1000,
+                      display: "flex", alignItems: "center", justifyContent: "center" }}
+             onClick={() => setConfirmDelete(null)}>
+          <div style={{ ...S.card, width: 420 }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ margin: "0 0 12px", fontSize: 15, color: "#dc2626" }}>システムの削除</h3>
+            <div style={{ fontSize: 13, color: "#334155", marginBottom: 16, lineHeight: 1.7 }}>
+              「<b>{confirmDelete.name}</b>」を削除します。<br />
+              所属する「システム全体」スレッドおよび関連する事業（事業数: {confirmDelete.project_count}件）がある場合は削除できません。<br />
+              <span style={{ color: "#ef4444" }}>この操作は取り消せません。</span>
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button onClick={() => setConfirmDelete(null)} style={chipBtn()}>キャンセル</button>
+              <button onClick={() => deleteSystem(confirmDelete)} style={btn("#dc2626")}>削除する</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* インポートモーダル */}
+      {showImport && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.4)", zIndex: 1000,
+                      display: "flex", alignItems: "center", justifyContent: "center" }}
+             onClick={() => setShowImport(false)}>
+          <div style={{ ...S.card, width: 420 }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ margin: "0 0 12px", fontSize: 15 }}>システムのインポート</h3>
+            <div style={{ fontSize: 12, color: "#64748b", marginBottom: 12, lineHeight: 1.7 }}>
+              エクスポートしたJSONファイル（システム単位）を選択してください。<br />
+              インポートされたシステムは新規に採番されます（既存システムは上書きされません）。
+            </div>
+            <input ref={importFileRef} type="file" accept="application/json,.json"
+              onChange={e => { const f = e.target.files?.[0]; if (f) importSystem(f); }}
+              style={{ display: "block", marginBottom: 16, fontSize: 12 }} />
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button onClick={() => setShowImport(false)} style={chipBtn()}>キャンセル</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {systems.length === 0
         ? <div style={{ ...S.card, ...S.empty }}>システムが登録されていません</div>
         : systems.map(s => (
@@ -3141,6 +3349,8 @@ function SystemsView({ headers, showToast }: { headers: () => Record<string, str
                 <span>スレッド {s.thread_count}件</span>
                 {s.open_count > 0 && <span style={{ color: "#ef4444", fontWeight: 700 }}>未解決 {s.open_count}件</span>}
               </div>
+              <button onClick={() => exportSystem(s)} style={chipBtn()} title="このシステムをJSONで書き出し">📤 出力</button>
+              <button onClick={() => setConfirmDelete(s)} style={chipBtn("#dc2626")} title="このシステムを削除">🗑 削除</button>
               <button onClick={() => {
                 if (expandedSys === s.id) { setExpandedSys(null); }
                 else { setExpandedSys(s.id); loadProjects(s.id); }
@@ -4051,19 +4261,41 @@ curl https://your-domain.go.jp/healthz
 
 ** APIエンドポイント
 
-| Method | Path | 権限 | 説明 |
-|--------+------+------+------|
-| GET | ~/projects/~ | read | PJ一覧 |
-| GET | ~/review/{id}~ | read | ログ取得 |
-| POST | ~/review/~ | write | コメント投稿 |
-| POST | ~/review/{id}/confirm~ | confirm | 評価確定 |
-| DELETE | ~/review/{id}~ | write | クローズ |
-| POST | ~/review/auto~ | write | AI自動レビュー |
-| GET | ~/review/{id}/audit~ | confirm | 監査ログ |
-| GET | ~/export/{id}/excel~ | export | Excel出力 |
-| GET | ~/export/{id}/pdf~ | export | PDF出力 |
-| POST | ~/notify/review/{id}~ | write | MCP通知 |
-| GET | ~/notify/logs/{id}~ | read | 通知履歴 |
+*** 事業・レビュー
+
+| Method | Path                     | 権限    | 説明                                |
+|--------+--------------------------+---------+-------------------------------------|
+| GET    | ~/projects/~             | read    | PJ一覧                              |
+| GET    | ~/review/{id}~           | read    | ログ取得                            |
+| POST   | ~/review/~               | write   | コメント投稿                        |
+| POST   | ~/review/{id}/confirm~   | confirm | 評価確定                            |
+| DELETE | ~/review/{id}~           | write   | クローズ                            |
+| POST   | ~/review/auto~           | write   | AI自動レビュー                      |
+| GET    | ~/review/{id}/audit~     | confirm | 監査ログ                            |
+| GET    | ~/export/{id}/excel~     | export  | 監査ログ Excel出力                  |
+| GET    | ~/export/{id}/pdf~       | export  | 監査ログ PDF出力                    |
+| POST   | ~/notify/review/{id}~    | write   | MCP通知                             |
+| GET    | ~/notify/logs/{id}~      | read    | 通知履歴                            |
+
+*** システム管理
+
+| Method | Path                                | 権限   | 説明                                                  |
+|--------+-------------------------------------+--------+-------------------------------------------------------|
+| GET    | ~/systems/~                         | read   | システム一覧                                          |
+| POST   | ~/systems/~                         | write  | システム新規登録（システム全体スレッドも自動作成）    |
+| PUT    | ~/systems/{id}~                     | write  | システム情報更新                                      |
+| DELETE | ~/systems/{id}~                     | manage | システム削除（配下の事業が0件の場合のみ可）           |
+| GET    | ~/systems/{id}/projects~            | read   | 配下事業一覧                                          |
+
+*** JSON 入出力
+
+| Method | Path                                     | 権限   | 説明                                                     |
+|--------+------------------------------------------+--------+----------------------------------------------------------|
+| GET    | ~/export/system/{id}/json~               | export | システム一式（事業・スレッド・投稿まで含む）を JSON 出力 |
+| POST   | ~/import/system~                         | manage | システム一式を新規 ID で取り込み                         |
+| GET    | ~/export/project/{id}/relay~             | export | 事業のレビューラリー履歴のみを JSON 出力                 |
+| POST   | ~/import/project/{id}/relay?mode=append~ | manage | ラリー履歴を既存に追記（thread_no は再採番）             |
+| POST   | ~/import/project/{id}/relay?mode=replace~ | manage | 既存スレッド全削除後にラリー履歴を投入                   |
 
 ** バックアップ
 
@@ -4072,6 +4304,52 @@ docker compose exec db pg_dump -U budget budget > backup_$(date +%Y%m%d).sql
 #+end_src
 
 * トラブルシューティング履歴
+
+** DBテーブル未作成エラー（解決済み）
+
+=psycopg2.errors.UndefinedTable: relation "systems" does not exist= が
+運用中に発生。原因は次の2点の複合だった。
+
+*** 原因1: init.sql の二重 CREATE TABLE 定義
+
+=init.sql= 内で =systems= / =projects= / =review_threads= の
+=CREATE TABLE IF NOT EXISTS= が *2ブロック* 書かれていた。
+2ブロック目は =projects= に =name= 列を持たないなど整合しない壊れた簡略定義で、
+=IF NOT EXISTS= のため実行時には無視されるが、他の開発者がそちらに合わせて
+誤修正を入れる温床になっていたため、完全に削除した。
+
+*** 原因2: 古い pgdata ボリュームの残存（*これが直接原因*）
+
+PostgreSQL 公式イメージの =/docker-entrypoint-initdb.d/= は
+*データディレクトリが空のとき* しか実行されない。
+以前の壊れた =init.sql= で初期化された =pgdata= が残っていたため、
+修正版 =init.sql= は再実行されず、DBに =systems= テーブルが存在しないまま
+API が叩かれて500エラーとなっていた。
+
+*** 対処手順
+
+#+begin_src shell :eval no
+# 開発環境（DB内データを捨てて良い場合）
+docker compose down -v          # -v で pgdata ボリュームも削除
+docker compose build --no-cache
+docker compose up
+
+# 起動後にテーブル作成を確認
+docker compose exec db psql -U budget -d budget -c "\dt"
+# 期待: systems, projects, review_threads, review_entries, users,
+#       project_files, webhook_logs, audit_logs が表示されること
+#+end_src
+
+#+begin_src shell :eval no
+# 本番・保持したいデータがある場合は init.sql を手動再適用
+# （CREATE TABLE IF NOT EXISTS なので既存テーブルは保持される）
+docker compose exec -T db psql -U budget -d budget < db/init.sql
+#+end_src
+
+| エラー                                              | 原因                                 | 対処                          |
+|-----------------------------------------------------+--------------------------------------+-------------------------------|
+| =relation "systems" does not exist=                 | 旧 pgdata 残存で init.sql 未再実行   | =docker compose down -v= で再初期化 |
+| =init.sql= に二重の CREATE TABLE                    | 過去コミットの残骸                   | 重複ブロックを削除            |
 
 ** フロントエンドビルド問題（解決済み）
 

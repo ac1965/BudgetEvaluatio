@@ -8,10 +8,11 @@
 
 * 改訂履歴
 
-| バージョン | 日付         | 内容                             |
-|------------+--------------+----------------------------------|
-| 1.0        | 2025-04      | 初版（PJMO予算評価レビューシステム） |
-| 2.0        | 2025-04（本版）| 全面改訂（予算額妥当性評価システム） |
+| バージョン | 日付         | 内容                                                         |
+|------------+--------------+--------------------------------------------------------------|
+| 1.0        | 2025-04      | 初版（PJMO予算評価レビューシステム）                         |
+| 2.0        | 2025-04      | 全面改訂（予算額妥当性評価システム）                         |
+| 2.1        | 2026-04（本版） | 実装整合改訂：DS-110/DS-910評価区分切替、JSON入出力拡張、監査ログ強化 |
 
 * 1. システム概要
 
@@ -28,17 +29,18 @@
 
 ** 1.2 主要機能
 
-| 機能                         | 説明                                                           |
-|------------------------------+----------------------------------------------------------------|
-| 評価対象システム管理         | 複数の評価対象システムと担当部署を登録・管理                  |
-| 事業管理                     | システム配下の事業（0:全体 + 1..N件）を管理。経費区分・要求額・見積・要件・根拠を保持 |
-| 評価ラリー                   | 事業単位で評価者↔PJMOの指摘-回答サイクルを管理。複数サイクル対応 |
-| 予算評価AIアドバイザー       | Ollama（qwen2.5）によるDS-110/DS-910準拠の対話型評価支援      |
-| AI自動レビュー               | テキスト貼付によるOllama自動指摘生成→スレッド自動作成         |
-| Excel/PDFエクスポート        | 評価ラリーの監査ログを出力                                    |
-| JSONエクスポート/インポート  | システム単位でのラリーデータ完全移植                          |
-| 監査ログ                     | 全操作を audit_logs テーブルに記録                            |
-| MCP/Webhook通知              | Agent Card（JSON-LD）形式でのイベント通知                     |
+| 機能                         | 説明                                                                                        |
+|------------------------------+---------------------------------------------------------------------------------------------|
+| 評価対象システム管理         | 複数の評価対象システムと担当部署を登録・管理                                                |
+| *評価区分切替*               | システム単位で DS-110（政府情報システム）/ DS-910（省システム・機微情報）を切替             |
+| 事業管理                     | システム配下の事業（全体仮想事業 + 1..N件）を管理。経費区分・要求額・見積・要件・根拠を保持 |
+| 評価ラリー                   | 事業単位で評価者↔PJMOの指摘-回答サイクルを管理。複数サイクル対応                            |
+| 予算評価AIアドバイザー       | Ollama（qwen2.5）によるDS-110/DS-910準拠の対話型評価支援                                    |
+| AI自動レビュー               | テキスト貼付によるOllama自動指摘生成→スレッド自動作成。*評価区分に応じてプロンプトを自動切替* |
+| Excel/PDFエクスポート        | 評価ラリーの監査ログを出力                                                                  |
+| JSONエクスポート/インポート  | システム単位／事業単位／リレー履歴単位での移植・同期                                        |
+| 監査ログ                     | 全操作（JSON I/O、AI指摘の評価区分を含む）を audit_logs テーブルに記録                      |
+| MCP/Webhook通知              | Agent Card（JSON-LD）形式でのイベント通知                                                   |
 
 ** 1.3 アーキテクチャ
 
@@ -68,10 +70,10 @@
 ** 2.1 テーブル一覧（ER概要）
 
 #+begin_example
-systems（評価対象システム）
+systems（評価対象システム、ds910_applicable フラグで DS-110/DS-910 を区別）
   │ 1
   │ N
-projects（事業）  ← id=0: システム全体（各システムに対して予約）
+projects（事業、is_system_wide=TRUE は「システム全体」仮想事業）
   │ 1
   │ N
 review_threads（指摘スレッド）
@@ -85,8 +87,8 @@ projects 1──N project_files（添付ファイル）
 | テーブル        | 説明                              | 主なキー関係              |
 |-----------------+-----------------------------------+---------------------------|
 | users           | ユーザー・RBAC                    | （独立）                  |
-| systems         | 評価対象システム                  | （独立）                  |
-| projects        | 事業（id=0: システム全体）        | system_id → systems       |
+| systems         | 評価対象システム（DS-110/DS-910） | （独立）                  |
+| projects        | 事業（is_system_wide で全体/個別）| system_id → systems       |
 | review_threads  | 指摘スレッド                      | project_id → projects     |
 | review_entries  | スレッド内投稿                    | thread_id → review_threads |
 | project_files   | 見積・要件・根拠ファイル          | project_id → projects     |
@@ -108,24 +110,45 @@ CREATE TABLE IF NOT EXISTS users (
 
 ** 2.3 systems（評価対象システム）
 
+=ds910_applicable= フラグで評価区分を識別する。TRUE の場合、AI自動指摘のプロンプトが
+DS-910 観点（機微情報・SBOM・国内立地・自律性等）に切り替わる。
+
 #+begin_src sql
 CREATE TABLE IF NOT EXISTS systems (
-    id           SERIAL PRIMARY KEY,
-    name         TEXT NOT NULL,       -- システム名
-    department   TEXT,                -- 担当部署
-    created_at   TIMESTAMP DEFAULT now()
+    id                SERIAL PRIMARY KEY,
+    name              TEXT NOT NULL,        -- システム名
+    department        TEXT,                 -- 担当部署
+    ds910_applicable  BOOLEAN NOT NULL DEFAULT FALSE,
+                                            -- TRUE:  DS-910対象（省システム・機微情報）
+                                            -- FALSE: DS-110 準拠の政府情報システム
+    created_at        TIMESTAMP DEFAULT now()
 );
+
+-- 既存DBへのカラム後追い（v2.0 → v2.1 マイグレーション）
+ALTER TABLE systems
+    ADD COLUMN IF NOT EXISTS ds910_applicable BOOLEAN NOT NULL DEFAULT FALSE;
 #+end_src
+
+*** 評価区分の判定基準
+
+| ds910_applicable | 区分                 | 評価観点の根拠                                   |
+|------------------+----------------------+--------------------------------------------------|
+| FALSE            | 政府情報システム     | DS-110（予算妥当性・Cloud by Default・同等品条項）|
+| TRUE             | 省システム・機微情報 | DS-910（機微情報範囲・SBOM・国内立地・自律性水準）|
+
+DS-910対象となる機微情報の範囲は §Ⅴ（国家安全影響情報・国際交渉情報・公共安全情報・経済安全保障情報）に準じる。
 
 ** 2.4 projects（事業）
 
-=id=0= の仮想事業を各システムの「システム全体」スレッド用として予約する。
+各システムには「システム全体」用の *仮想事業*（=is_system_wide=TRUE=）を1件自動生成する。
+システム追加時に =systems_router.py= の create_system が自動挿入する。
 
 #+begin_src sql
 CREATE TABLE IF NOT EXISTS projects (
     id                 SERIAL PRIMARY KEY,
     system_id          INT REFERENCES systems(id) NOT NULL,
-    name               TEXT NOT NULL,          -- 事業名（id=0 は「システム全体」）
+    name               TEXT NOT NULL,          -- 事業名
+    is_system_wide     BOOLEAN DEFAULT FALSE,  -- TRUE: システム全体スレッド用の仮想事業
     cost_category      TEXT
                        CHECK (cost_category IN (
                            '整備費（投資的整備）',
@@ -150,6 +173,13 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 #+end_src
 
+#+begin_quote
+設計上の注意：
+- システム全体スレッドは =is_system_wide = TRUE= の仮想事業配下に作成される
+- システム削除は配下の =is_system_wide = FALSE= の事業が0件の場合のみ可能
+- JSONインポート時は新規採番される（id は保持されない）
+#+end_quote
+
 *** 経費区分（別紙２準拠）
 
 | 値                         | 別紙２区分                                           |
@@ -166,7 +196,8 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS review_threads (
     id          SERIAL PRIMARY KEY,
     project_id  INT REFERENCES projects(id) NOT NULL,
-                -- 0: システム全体、1..N: 各事業
+                -- is_system_wide=TRUE の仮想事業配下: システム全体スレッド
+                -- is_system_wide=FALSE の通常事業配下: 事業別スレッド
     thread_no   INT NOT NULL,     -- 事業内連番（#1, #2...）
     title       TEXT,             -- 指摘タイトル（任意）
     status      TEXT NOT NULL DEFAULT 'open'
@@ -283,47 +314,75 @@ CREATE TABLE IF NOT EXISTS webhook_logs (
 
 * 3. APIエンドポイント設計
 
-** 3.1 システム管理（新規）
+** 3.1 システム管理
 
-| Method | Path                         | 権限   | 説明                           |
-|--------+------------------------------+--------+--------------------------------|
-| GET    | =/systems/=                  | read   | システム一覧（事業数含む）     |
-| POST   | =/systems/=                  | write  | システム新規作成               |
-| PUT    | =/systems/{id}=              | write  | システム更新                   |
-| DELETE | =/systems/{id}=              | manage | システム削除（事業なし時のみ） |
-| GET    | =/systems/{id}/projects=     | read   | 事業一覧（project_id=0含む）   |
+| Method | Path                          | 権限   | 説明                                                     |
+|--------+-------------------------------+--------+----------------------------------------------------------|
+| GET    | =/systems/=                   | read   | システム一覧（事業数・スレッド数・ds910_applicable 含む）|
+| POST   | =/systems/=                   | write  | システム新規作成（=ds910_applicable= 指定可、全体仮想事業も自動生成） |
+| PUT    | =/systems/{id}=               | write  | システム更新（=ds910_applicable= の区分切替可能）        |
+| DELETE | =/systems/{id}=               | manage | システム削除（配下の非仮想事業が0件時のみ）              |
+| GET    | =/systems/{id}/projects=      | read   | 事業一覧（仮想事業含む、is_system_wide DESC でソート）   |
 
-** 3.2 事業管理（改訂）
+** 3.2 事業管理
 
-| Method | Path                         | 権限   | 説明                             |
-|--------+------------------------------+--------+----------------------------------|
-| POST   | =/projects/=                 | write  | 事業新規作成                     |
-| PUT    | =/projects/{id}=             | write  | 事業更新（経費区分・要求額等）   |
-| DELETE | =/projects/{id}=             | manage | 事業削除（スレッドなし時のみ）   |
-| POST   | =/projects/{id}/files=       | write  | ファイルアップロード             |
-| GET    | =/projects/{id}/files=       | read   | ファイル一覧                     |
-| DELETE | =/projects/{id}/files/{fid}= | write  | ファイル削除                     |
+| Method | Path                          | 権限   | 説明                             |
+|--------+-------------------------------+--------+----------------------------------|
+| POST   | =/projects/=                  | write  | 事業新規作成                     |
+| PUT    | =/projects/{id}=              | write  | 事業更新（経費区分・要求額等）   |
+| DELETE | =/projects/{id}=              | manage | 事業削除（スレッドなし時のみ）   |
+| POST   | =/projects/{id}/files=        | write  | ファイルアップロード             |
+| GET    | =/projects/{id}/files=        | read   | ファイル一覧                     |
+| DELETE | =/projects/{id}/files/{fid}=  | write  | ファイル削除                     |
 
-** 3.3 評価ラリー（新規）
+** 3.3 評価ラリー
 
-| Method | Path                          | 権限  | 説明                            |
-|--------+-------------------------------+-------+---------------------------------|
-| GET    | =/threads/{project_id}=       | read  | スレッド一覧                    |
-| POST   | =/threads/=                   | write | 新規スレッド（issue 作成）      |
-| PUT    | =/threads/{id}/due=           | write | 期限日変更                      |
-| GET    | =/threads/{id}/entries=       | read  | 投稿一覧                        |
-| POST   | =/threads/{id}/entries=       | write | 投稿追加（reply/review/close）  |
-| POST   | =/threads/auto=               | write | AI自動指摘スレッド生成          |
+| Method | Path                          | 権限  | 説明                                                       |
+|--------+-------------------------------+-------+------------------------------------------------------------|
+| GET    | =/threads/{project_id}=       | read  | スレッド一覧                                               |
+| POST   | =/threads/=                   | write | 新規スレッド（issue 作成）                                 |
+| PUT    | =/threads/{id}/due=           | write | 期限日変更                                                 |
+| GET    | =/threads/{id}/entries=       | read  | 投稿一覧                                                   |
+| POST   | =/threads/{id}/entries=       | write | 投稿追加（reply/review/close、status を自動遷移）          |
+| POST   | =/threads/auto=               | write | *AI自動指摘*：事業→システム逆引きで DS-910/DS-110 プロンプトを自動切替。レスポンスに =mode= フィールドを含む |
 
-** 3.4 JSONエクスポート/インポート（新規）
+*** AI自動指摘の評価区分切替
 
-| Method | Path                               | 権限   | 説明                       |
-|--------+------------------------------------+--------+----------------------------|
-| GET    | =/export/system/{system_id}/json=  | export | システム単位JSONエクスポート |
-| POST   | =/import/system=                   | manage | JSONインポート              |
-| GET    | =/export/project/{project_id}/json=| export | 事業単位JSONエクスポート    |
+=/threads/auto= は対象事業の所属システムの =ds910_applicable= を参照して
+プロンプトを動的に選択する。
 
-** 3.5 既存エンドポイント（継続）
+| ds910_applicable | system_prompt        | 生成スレッドタイトル    | レスポンス mode |
+|------------------+----------------------+-------------------------+-----------------|
+| TRUE             | DS-910観点プロンプト | =[AI自動指摘/DS-910]=   | =DS-910=        |
+| FALSE            | DS-110観点プロンプト | =[AI自動指摘/DS-110]=   | =DS-110=        |
+
+AIへの user メッセージ冒頭には以下の文脈ヘッダが自動付与される：
+
+#+begin_example
+【対象システム情報】
+・システム名: {systems.name}
+・担当部署: {systems.department}
+・区分: {DS-910対象（省システム・機微情報）|政府情報システム（DS-110準拠）}
+
+【評価対象ドキュメント】
+{ユーザー貼付テキスト}
+#+end_example
+
+** 3.4 JSONエクスポート/インポート
+
+| Method | Path                                      | 権限   | 説明                                                           |
+|--------+-------------------------------------------+--------+----------------------------------------------------------------|
+| GET    | =/export/system/{system_id}/json=         | export | システム一式（事業・スレッド・投稿、=ds910_applicable= 含む）  |
+| GET    | =/export/project/{project_id}/json=       | export | 事業単位（事業設定＋配下スレッド全体）                         |
+| GET    | =/export/project/{project_id}/relay=      | export | リレーデータ（review_threads + review_entries のみ）           |
+| POST   | =/import/system/check=                    | manage | インポート前の同名システム重複チェック（§6.2）                 |
+| POST   | =/import/system=                          | manage | システム一式を新規採番でインポート                             |
+| POST   | =/import/project/{id}/relay?mode=append=  | manage | リレー履歴を既存に追記（thread_no 再採番）                     |
+| POST   | =/import/project/{id}/relay?mode=replace= | manage | 既存スレッド全削除後にリレー履歴投入                           |
+
+全てのインポート／エクスポートは =audit_logs= に区分情報を含めて記録される。
+
+** 3.5 既存エンドポイント
 
 | Prefix     | 本数 | 主な操作                              |
 |------------+------+---------------------------------------|
@@ -336,50 +395,70 @@ CREATE TABLE IF NOT EXISTS webhook_logs (
 
 ** 4.1 ビュー一覧
 
-| キー         | ラベル             | 内容                                     | 状態     |
-|--------------+--------------------+------------------------------------------+----------|
-| =dashboard=  | ダッシュボード     | システム一覧・評価進捗サマリー           | 改訂     |
-| =systems=    | システム管理       | 評価対象システム・事業の登録/編集/一覧   | 新規     |
-| =rally=      | 評価ラリー         | 事業単位のスレッド一覧・投稿UI           | 改訂     |
-| =advisor=    | 予算評価AI         | DS-110/DS-910対話型評価チャット          | 継続     |
-| =audit=      | 監査ログ           | 全操作記録（evaluator以上）              | 継続     |
-| =webhook=    | 通知履歴           | MCP/Webhook送信履歴                      | 継続     |
+| キー         | ラベル             | 内容                                                         |
+|--------------+--------------------+--------------------------------------------------------------|
+| =dashboard=  | ダッシュボード     | システム一覧・評価進捗サマリー                               |
+| =systems=    | システム管理       | 評価対象システム・事業の登録/編集/削除、DS-910区分切替、JSON入出力 |
+| =rally=      | 評価ラリー         | 事業単位のスレッド一覧・投稿UI・AI自動指摘（区分連動）       |
+| =advisor=    | 予算評価AI         | DS-110/DS-910対話型評価チャット                              |
+| =audit=      | 監査ログ           | 全操作記録（evaluator以上）                                  |
+| =webhook=    | 通知履歴           | MCP/Webhook送信履歴                                          |
 
 #+begin_quote
-「AI自動レビュー（ai）」ビューは「評価ラリー（rally）」に統合する。
-テキスト貼付でAI自動指摘スレッドを生成する機能として再実装する。
+「AI自動レビュー（ai）」ビューは「評価ラリー（rally）」に統合済み。
+テキスト貼付でAI自動指摘スレッドを生成する機能として実装されている。
 #+end_quote
 
 ** 4.2 ダッシュボード
 
 - システム一覧をカード形式で表示
 - 各カードに事業数・スレッド総数・open件数・closed率を表示
+- DS-910対象システムは赤系バッジ（🔒 DS-910）で区別
 - クリックでシステム詳細（事業一覧）へ遷移
 
 ** 4.3 システム管理画面
 
-- システム新規作成フォーム（システム名・担当部署）
-- 事業一覧テーブル（事業名・経費区分・要求額合計・評価者名・スレッド数）
+- システム新規作成モーダル
+  - システム名（必須）・担当部署
+  - *DS-910対象チェックボックス*（機微情報を扱う省システムの場合にチェック）
+- システム一覧カード（DS-910対象は左端に赤縦線＋ 🔒 DS-910 バッジ、政府情報システムは DS-110 バッジ）
+- 各カードの操作ボタン
+  - *⇄ 区分* : DS-110 ↔ DS-910 の評価区分切替（confirm プロンプト付）
+  - *📤 出力* : システム一式を JSON ダウンロード
+  - *🗑 削除* : システム削除（配下の非仮想事業が0件時のみ可）
+  - *▼ 事業一覧* : 配下事業の展開
+- 画面上部の *📥 インポート* ボタンで JSON ファイルからシステム取り込み（同名重複時は confirm プロンプト）
 - 事業追加フォーム（経費区分・要求額3種・評価者名・見積/要件/根拠テキスト+ファイル）
 
 ** 4.4 評価ラリー画面
 
 #+begin_example
-┌──────────────┬────────────────────┬───────────────────────────┐
-│              │                    │                           │
-│  システム    │  スレッド一覧      │  スレッド詳細             │
-│  ・事業      │                    │                           │
-│  選択ペイン  │  [#1] 積算根拠確認 │  2025-01-10 evaluator     │
-│              │  期限: 03-31  open │  「積算根拠の内訳が...」  │
-│  [システム全体] │               │                           │
-│  [事業#1]    │  [#2] Cloud確認   │  2025-01-20 pjmo          │
-│  [事業#2]    │  期限: 03-15 closed│  「FP計算書を追加...」    │
-│  [＋ 事業追加] │              │                           │
-│              │  [＋ 指摘追加]    │  [再評価] [確定]          │
-│              │  [🤖 AI指摘]      │  ─────────────────────── │
-│              │                    │  [新規投稿フォーム]       │
-└──────────────┴────────────────────┴───────────────────────────┘
+┌──────────────────┬────────────────────┬───────────────────────────┐
+│                  │                    │                           │
+│  システム選択    │  スレッド一覧      │  スレッド詳細             │
+│  🔒 DS-910 /     │                    │                           │
+│  DS-110 バッジ   │  [#1] 積算根拠確認 │  2025-01-10 evaluator     │
+│                  │  期限: 03-31  open │  「積算根拠の内訳が...」  │
+│  [システム全体]  │                    │                           │
+│  [事業#1]        │  [#2] Cloud確認   │  2025-01-20 pjmo          │
+│  [事業#2]        │  期限: 03-15 closed│  「FP計算書を追加...」    │
+│  [＋ 事業追加]   │                    │                           │
+│                  │  [＋ 指摘追加]     │  [再評価] [確定]          │
+│                  │  ─────────────── │  ─────────────────────── │
+│                  │  🤖 AI自動指摘    │  [新規投稿フォーム]       │
+│                  │  (DS-910/DS-110)  │                           │
+│                  │  [テキスト貼付]    │                           │
+│                  │  [AI指摘を生成]    │                           │
+└──────────────────┴────────────────────┴───────────────────────────┘
 #+end_example
+
+*** 評価区分の動的表示
+
+- 選択中システムの =ds910_applicable= により画面要素が変化：
+  - システム選択プルダウン: DS-910対象は先頭に「🔒」を付与
+  - 評価モードバッジ: 「🔒 DS-910 評価モード」（赤系）/「DS-110 評価モード」（青系）
+  - AI自動指摘セクション: DS-910時は背景赤系・ボタン赤系・プレースホルダ文言も変化
+  - AI指摘生成ボタン: 「AI指摘を生成（DS-910）」/「AI指摘を生成（DS-110）」
 
 * 5. RBAC権限設計
 
@@ -425,21 +504,30 @@ ROLE_PERMISSIONS = {
 
 * 6. JSONエクスポート/インポート仕様
 
-** 6.1 スキーマ
+JSON 入出力は3種類提供する。
+
+| エクスポート種別 | 範囲                                    | 主な用途                         |
+|------------------+-----------------------------------------+----------------------------------|
+| システム単位     | システム設定＋全事業＋全スレッド＋全投稿| システム移植・環境複製・バックアップ |
+| 事業単位         | 事業設定＋配下スレッド＋投稿            | 事業のみの複製                   |
+| リレーデータ     | review_threads + review_entries のみ    | 履歴のみ共有（設定は共有しない） |
+
+** 6.1 スキーマ（システム単位）
 
 #+begin_src json
 {
   "export_version": "1.0",
-  "exported_at": "2025-04-19T12:00:00+09:00",
+  "exported_at": "2026-04-19T12:00:00+09:00",
   "system": {
     "id": 1,
     "name": "人事給与システム（次期）",
-    "department": "人事院"
+    "department": "人事院",
+    "ds910_applicable": false
   },
   "projects": [
     {
-      "id": 0,
       "name": "システム全体",
+      "is_system_wide": true,
       "cost_category": null,
       "amount_single": 0,
       "amount_advance": 0,
@@ -464,13 +552,16 @@ ROLE_PERMISSIONS = {
       ]
     },
     {
-      "id": 1,
       "name": "令和8年度 整備事業",
+      "is_system_wide": false,
       "cost_category": "整備費（投資的整備）",
       "amount_single": 150000,
       "amount_advance": 0,
       "amount_deferred": 80000,
       "evaluator_name": "田中係長",
+      "estimate_text": null,
+      "requirements_text": null,
+      "basis_text": null,
       "threads": [
         {
           "thread_no": 1,
@@ -524,15 +615,100 @@ ROLE_PERMISSIONS = {
 ** 6.2 インポート時の動作
 
 - =system.id= は無視し、新規採番する
-- =project.id= は無視し、新規採番する（id=0 のシステム全体は自動作成）
+- =project.id= は無視し、新規採番する（is_system_wide の仮想事業も正しく復元される）
+- =ds910_applicable= は設計書 §2.3 の評価区分としてそのまま取り込む
 - スレッドと投稿は =thread_no= および =seq= の順序で復元する
-- 既存データとの重複チェック: システム名が一致する場合は確認プロンプトを表示
+- 既存データとの重複チェックは =/import/system/check= で事前に確認（§6.5）
+
+** 6.3 スキーマ（事業単位）
+
+事業単位エクスポート（=/export/project/{id}/json=）の出力形式：
+
+#+begin_src json
+{
+  "export_version": "1.0",
+  "export_type": "project",
+  "exported_at": "2026-04-19T12:00:00+09:00",
+  "system": {
+    "id": 1,
+    "name": "人事給与システム（次期）",
+    "department": "人事院",
+    "ds910_applicable": false
+  },
+  "project": {
+    "name": "令和8年度 整備事業",
+    "is_system_wide": false,
+    "cost_category": "整備費（投資的整備）",
+    "amount_single": 150000,
+    "amount_advance": 0,
+    "amount_deferred": 80000,
+    "evaluator_name": "田中係長",
+    "estimate_text": null,
+    "requirements_text": null,
+    "basis_text": null
+  },
+  "threads": [ ... ]
+}
+#+end_src
+
+=system= ブロックは参照情報（所属システムの属性）であり、インポート時は使用しない。
+
+** 6.4 スキーマ（リレーデータ）
+
+リレーデータエクスポート（=/export/project/{id}/relay=）の出力形式：
+
+#+begin_src json
+{
+  "export_version": "1.0",
+  "export_type": "relay",
+  "exported_at": "2026-04-19T12:00:00+09:00",
+  "project": { "id": 1, "name": "令和8年度 整備事業", "system_id": 1 },
+  "threads": [ ... ]
+}
+#+end_src
+
+リレーデータのインポートは mode パラメータで動作が変わる：
+
+| mode      | 動作                                                           |
+|-----------+----------------------------------------------------------------|
+| =append=  | 既存スレッドを残し、thread_no を再採番して追記                 |
+| =replace= | 既存の review_threads / review_entries を全削除してから投入    |
+
+replace モードは破壊的操作のため =audit_logs= に削除件数と共に記録される。
+
+** 6.5 インポート前重複チェック
+
+システム単位インポート（=/import/system=）の前に、=/import/system/check= を呼ぶことで
+同名システムの存在を確認できる。
+
+#+begin_src json
+// /import/system/check のレスポンス例
+{
+  "duplicate": true,
+  "matched": [
+    { "id": 1, "name": "人事給与システム（次期）", "department": "人事院" }
+  ],
+  "summary": {
+    "system_name": "人事給与システム（次期）",
+    "project_count": 3
+  }
+}
+#+end_src
+
+フロントエンドは =duplicate=true= の場合、=window.confirm= で利用者に確認を求める。
+インポートは常に *新規採番* で実行され、既存システムは上書きされない。
 
 * 7. 移行計画
 
-** 7.1 現行→新スキーマ変換方針
+** 7.1 v1.0 → v2.0 移行（実施済）
 
-| 現行テーブル/カラム             | 新テーブル/カラム                           | 変換方法                         |
+v1.0（PJMO予算評価レビューシステム）から v2.0（予算額妥当性評価システム）への
+スキーマ移行は実施済みである。v1.0 由来の =backend/projects.py= / =backend/review.py=
+は旧スキーマ参照のため =:tangle no= で生成対象から除外されており、参考資料として残置されている。
+
+*** v1.0 → v2.0 の変換マッピング（記録）
+
+| v1.0 テーブル/カラム            | v2.0 テーブル/カラム                        | 変換方法                         |
 |---------------------------------+---------------------------------------------+----------------------------------|
 | projects（category=system）     | systems                                     | systemsテーブルに移行            |
 | projects（category=project）    | projects（新）                              | system_id を付与して移行         |
@@ -544,49 +720,35 @@ ROLE_PERMISSIONS = {
 | review_logs.confirmed_by        | review_entries（entry_type='close'）        | closeエントリとして移行          |
 | review_logs.confirmed_at        | review_entries.entry_date                   | 記録日付として移行               |
 
-** 7.2 移行手順
+** 7.2 v2.0 → v2.1 移行（DS-910区分導入）
 
-1. =systems= テーブル作成・既存 =projects（category=system）= から移行
-2. =projects= テーブルに =system_id=, =cost_category=, =amount_*=, =evaluator_name= カラム追加
-3. =review_threads=, =review_entries= テーブル新規作成
-4. =project_files= テーブル新規作成
-5. =review_logs= を =review_threads= + =review_entries= へ変換移行
-6. 旧テーブル =review_logs= は =backup_review_logs= にリネームして保持
+v2.1 では =systems.ds910_applicable= カラムを追加し、評価区分（DS-110/DS-910）を
+システム単位で識別できるようにした。既存 pgdata を保持したまま列を追加する場合の手順：
 
-** 7.3 移行スクリプト（概要）
+#+begin_src shell :eval no
+# 既存DBにカラム追加（init.sql にも同等の ALTER が同梱されている）
+docker compose exec -T db psql -U budget -d budget <<SQL
+ALTER TABLE systems
+    ADD COLUMN IF NOT EXISTS ds910_applicable BOOLEAN NOT NULL DEFAULT FALSE;
+SQL
 
-#+begin_src sql
--- Step 1: systems テーブル作成
-CREATE TABLE systems AS
-  SELECT id, name, description AS department, created_at
-  FROM projects
-  WHERE category = 'system';
-
--- Step 2: projects に system_id を追加
-ALTER TABLE projects ADD COLUMN system_id INT REFERENCES systems(id);
--- ※ 既存の category='project' レコードへの system_id 割り当ては手動確認が必要
-
--- Step 3: review_threads 作成（既存 review_logs から1スレッド1投稿として移行）
-INSERT INTO review_threads (project_id, thread_no, status, created_at)
-SELECT project_id,
-       ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY created_at),
-       CASE status WHEN 'close' THEN 'closed' ELSE 'open' END,
-       created_at
-FROM review_logs;
-
--- Step 4: review_entries 作成
-INSERT INTO review_entries (thread_id, seq, entry_type, role, comment, entry_date)
-SELECT rt.id, 1,
-       rl.status,
-       CASE rl.role WHEN '評価者' THEN 'evaluator' WHEN 'PJMO' THEN 'pjmo' ELSE 'ai' END,
-       rl.comment,
-       rl.created_at::date
-FROM review_logs rl
-JOIN review_threads rt ON rt.project_id = rl.project_id;
-
--- Step 5: 旧テーブルをバックアップ
-ALTER TABLE review_logs RENAME TO backup_review_logs;
+# 既存システムを DS-910 対象へ切替える場合
+docker compose exec db psql -U budget -d budget \
+  -c "UPDATE systems SET ds910_applicable = TRUE WHERE id = 3;"
 #+end_src
+
+*** v2.0 → v2.1 の影響範囲
+
+| 層       | 変更内容                                                                 |
+|----------+--------------------------------------------------------------------------|
+| DB       | =systems.ds910_applicable= 列追加（default FALSE）                       |
+| Backend  | =/systems/= CRUD が区分読み書き対応、=/threads/auto= がプロンプト自動切替 |
+| JSON入出力 | =ds910_applicable= をスキーマに含めて往復                                |
+| Frontend | 新規モーダルのチェックボックス、カードのバッジ、区分切替ボタン、ラリー画面の評価モード表示 |
+| 監査ログ | create_system / update_system / import_system / auto_thread に区分情報を記録 |
+
+既存データは全て =ds910_applicable = FALSE=（DS-110評価）として扱われ、
+機微情報システムに該当するものは管理者が個別に =UPDATE= するか、UI の区分切替で変更する。
 
 * 8. 技術的補足
 
@@ -603,7 +765,7 @@ ALTER TABLE review_logs RENAME TO backup_review_logs;
 |-------------------+---------------------------+-----------------------------|
 | デフォルトモデル  | qwen2.5                   | =OLLAMA_MODEL= 環境変数     |
 | Ollama URL        | http://ollama:11434       | =OLLAMA_URL= 環境変数       |
-| タイムアウト      | 180秒（advisor: 180秒）   | advisor_router.py           |
+| タイムアウト      | 120秒（auto）/ 180秒（advisor） | *_router.py           |
 
 #+begin_src shell :eval no
 # モデル変更手順
@@ -612,7 +774,59 @@ docker compose exec ollama ollama pull qwen2.5:14b
 docker compose restart backend
 #+end_src
 
-** 8.3 推奨モデル一覧
+** 8.3 AI自動指摘プロンプト設計（DS-110/DS-910切替）
+
+=/threads/auto= は評価対象事業の所属システムの =ds910_applicable= を参照し、
+以下2種類の system_prompt を切替える。いずれも根拠条項の明示・「一式」表記の排除・
+「同等以上」条項の確認を求める点は共通である。
+
+*** DS-910対象プロンプト（機微情報システム）
+
+- 役割設定: 「日本の政府IT調達のセキュリティアーキテクト」
+- 最優先評価観点:
+  1. 機微情報の範囲と社会的影響の認識（§Ⅴ: 国家安全・国際交渉・公共安全・経済安全保障）
+  2. 構成要素別リスク対応（§Ⅱ）
+     - データ: 操作権限制限、暗号化、データ削除、冗長性
+     - 運用: 運用体制、監査体制、障害対応
+     - ソフトウェア: SBOM提出、脆弱性対応、ライフサイクル管理
+     - ハードウェア: 調達リスク管理、ファームウェア管理
+     - データセンタ・通信: 国内立地、SLA管理、冗長構成
+  3. クラウド化評価（§Ⅲ: NISTクラウド要件、自律性確保、技術陳腐化リスク）
+  4. データ連携評価（§Ⅳ: 自律性差異、連携脆弱性、データ保存・処理の所在）
+  5. 自律性水準設定・国内外基準の継続注視（§Ⅰ）
+- 副次評価: DS-110（予算妥当性・調達透明性）
+
+*** DS-110対象プロンプト（政府情報システム）
+
+- 役割設定: 「日本の政府IT調達のデジタル統括アドバイザー」
+- 評価観点（DS-110 第3編第3章「予算及び執行」準拠）:
+  1. 予算マネジメント基礎: コスト分解、当初想定と実運用の乖離、調達方法の事前検討
+  2. 費用対効果・投資妥当性: システム機能範囲、中長期投資計画、国庫債務負担行為
+  3. 資料準備・要求根拠の合理性: サービスレベル、実データ根拠、要求額の積算精査
+  4. 経費見積りの適正性: 積算内訳、LCC、システム単位積算、経費区分、複数見積比較、*Cloud by Default*
+  5. ガバナンス・承認プロセス: PMO資料提出、デジタル庁指摘対応、プロジェクト計画反映
+
+*** user メッセージの文脈ヘッダ
+
+どちらのプロンプトでも、user メッセージ冒頭に以下の文脈情報を自動付与する：
+
+#+begin_example
+【対象システム情報】
+・システム名: {systems.name}
+・担当部署: {systems.department}
+・区分: {DS-910対象（省システム・機微情報）|政府情報システム（DS-110準拠）}
+
+【評価対象ドキュメント】
+{ユーザーが貼り付けた仕様書・見積書の本文}
+#+end_example
+
+*** 生成スレッドの自動ラベリング
+
+- スレッドタイトル（未指定時）: =[AI自動指摘/DS-910]= または =[AI自動指摘/DS-110]=
+- APIレスポンス: =mode: "DS-910"= または =mode: "DS-110"= を含む
+- 監査ログ: =detail= に =ds910_applicable= と =system_id= を記録
+
+** 8.4 推奨モデル一覧
 
 | モデル         | サイズ  | 特徴                             |
 |----------------+---------+----------------------------------|
@@ -622,7 +836,7 @@ docker compose restart backend
 | =llama3.2=     | ~2GB    | 軽量・高速（英語中心）           |
 | =mistral=      | ~4.1GB  | 汎用高性能                       |
 
-** 8.4 Docker Compose サービス構成
+** 8.5 Docker Compose サービス構成
 
 #+begin_src yaml :eval no
 services:

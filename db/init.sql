@@ -105,6 +105,28 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     created_at   TIMESTAMP DEFAULT now()
 );
 
+-- init.sql
+CREATE TABLE IF NOT EXISTS systems (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    department TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+    id SERIAL PRIMARY KEY,
+    system_id INT REFERENCES systems(id),
+    is_system_wide BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS review_threads (
+    id SERIAL PRIMARY KEY,
+    project_id INT REFERENCES projects(id),
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- ════════════════════════════════════════════════════════
 --  サンプルデータ
 -- ════════════════════════════════════════════════════════

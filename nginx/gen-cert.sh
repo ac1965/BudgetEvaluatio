@@ -1,3 +1,4 @@
+#!/bin/bash
 set -e
 CERT_DIR="$(dirname "$0")/certs"
 mkdir -p "$CERT_DIR"

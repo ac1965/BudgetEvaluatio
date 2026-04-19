@@ -1,0 +1,634 @@
+#+TITLE: 予算額妥当性評価システム 設計書
+#+AUTHOR: たかお
+#+DATE: 令和7年（2025年）4月
+#+LANGUAGE: ja
+#+STARTUP: overview
+#+OPTIONS: toc:3 num:t ^:nil
+#+PROPERTY: header-args :mkdirp yes
+
+* 改訂履歴
+
+| バージョン | 日付         | 内容                             |
+|------------+--------------+----------------------------------|
+| 1.0        | 2025-04      | 初版（PJMO予算評価レビューシステム） |
+| 2.0        | 2025-04（本版）| 全面改訂（予算額妥当性評価システム） |
+
+* 1. システム概要
+
+** 1.1 目的
+
+予算額妥当性評価システムは、日本の政府IT調達における以下の標準ガイドラインに準拠した
+予算評価業務を支援するWebアプリケーションである。
+
+- DS-110 :: デジタル・ガバメント推進標準ガイドライン（第3編第3章「予算及び執行」）
+- DS-910 :: 安全保障等の機微な情報に係る政府情報システムの取扱い
+
+評価者とPJMOの往復評価（ラリー）を構造化・履歴管理し、複数の評価対象システムおよびその
+事業単位での評価進捗を一元管理する。
+
+** 1.2 主要機能
+
+| 機能                         | 説明                                                           |
+|------------------------------+----------------------------------------------------------------|
+| 評価対象システム管理         | 複数の評価対象システムと担当部署を登録・管理                  |
+| 事業管理                     | システム配下の事業（0:全体 + 1..N件）を管理。経費区分・要求額・見積・要件・根拠を保持 |
+| 評価ラリー                   | 事業単位で評価者↔PJMOの指摘-回答サイクルを管理。複数サイクル対応 |
+| 予算評価AIアドバイザー       | Ollama（qwen2.5）によるDS-110/DS-910準拠の対話型評価支援      |
+| AI自動レビュー               | テキスト貼付によるOllama自動指摘生成→スレッド自動作成         |
+| Excel/PDFエクスポート        | 評価ラリーの監査ログを出力                                    |
+| JSONエクスポート/インポート  | システム単位でのラリーデータ完全移植                          |
+| 監査ログ                     | 全操作を audit_logs テーブルに記録                            |
+| MCP/Webhook通知              | Agent Card（JSON-LD）形式でのイベント通知                     |
+
+** 1.3 アーキテクチャ
+
+#+begin_example
+ブラウザ（Safari）
+  │
+  ▼
+フロントエンド: React 18 + TypeScript + Vite 5（ポート3005）
+  │  /api/* → Viteプロキシ
+  ▼
+バックエンド: FastAPI / Python 3.12（ポート8000）
+  ├─ PostgreSQL 16（ポート5432）
+  └─ Ollama qwen2.5（CPU、ポート11434）
+#+end_example
+
+| 層             | 技術・バージョン                              |
+|----------------+-----------------------------------------------|
+| フロントエンド | React 18 + TypeScript + Vite 5.1.4（ポート3005） |
+| バックエンド   | FastAPI / Python 3.12（ポート8000）           |
+| データベース   | PostgreSQL 16                                 |
+| AIエンジン     | Ollama（qwen2.5、CPU動作）                    |
+| プロキシ       | Vite devサーバー /api/* → backend:8000        |
+| 本番環境       | nginx（HTTPS）+ Docker Compose                |
+
+* 2. データベース設計
+
+** 2.1 テーブル一覧（ER概要）
+
+#+begin_example
+systems（評価対象システム）
+  │ 1
+  │ N
+projects（事業）  ← id=0: システム全体（各システムに対して予約）
+  │ 1
+  │ N
+review_threads（指摘スレッド）
+  │ 1
+  │ N
+review_entries（スレッド内投稿）
+
+projects 1──N project_files（添付ファイル）
+#+end_example
+
+| テーブル        | 説明                              | 主なキー関係              |
+|-----------------+-----------------------------------+---------------------------|
+| users           | ユーザー・RBAC                    | （独立）                  |
+| systems         | 評価対象システム                  | （独立）                  |
+| projects        | 事業（id=0: システム全体）        | system_id → systems       |
+| review_threads  | 指摘スレッド                      | project_id → projects     |
+| review_entries  | スレッド内投稿                    | thread_id → review_threads |
+| project_files   | 見積・要件・根拠ファイル          | project_id → projects     |
+| audit_logs      | 操作監査ログ                      | （独立）                  |
+| webhook_logs    | Webhook送信ログ                   | project_id → projects     |
+
+** 2.2 users（ユーザー・RBAC）
+
+#+begin_src sql
+CREATE TABLE IF NOT EXISTS users (
+    id           SERIAL PRIMARY KEY,
+    username     TEXT UNIQUE NOT NULL,
+    display_name TEXT NOT NULL,
+    role         TEXT NOT NULL
+                 CHECK (role IN ('admin', 'evaluator', 'pjmo', 'viewer')),
+    created_at   TIMESTAMP DEFAULT now()
+);
+#+end_src
+
+** 2.3 systems（評価対象システム）
+
+#+begin_src sql
+CREATE TABLE IF NOT EXISTS systems (
+    id           SERIAL PRIMARY KEY,
+    name         TEXT NOT NULL,       -- システム名
+    department   TEXT,                -- 担当部署
+    created_at   TIMESTAMP DEFAULT now()
+);
+#+end_src
+
+** 2.4 projects（事業）
+
+=id=0= の仮想事業を各システムの「システム全体」スレッド用として予約する。
+
+#+begin_src sql
+CREATE TABLE IF NOT EXISTS projects (
+    id                 SERIAL PRIMARY KEY,
+    system_id          INT REFERENCES systems(id) NOT NULL,
+    name               TEXT NOT NULL,          -- 事業名（id=0 は「システム全体」）
+    cost_category      TEXT
+                       CHECK (cost_category IN (
+                           '整備費（投資的整備）',
+                           '整備費（維持的整備）',
+                           '整備費（サービス利用料）',
+                           '運用費',
+                           '保守費'
+                       )),
+    -- 要求額（千円単位）
+    amount_single      INTEGER DEFAULT 0,      -- 単歳要求額
+    amount_advance     INTEGER DEFAULT 0,      -- 前払金
+    amount_deferred    INTEGER DEFAULT 0,      -- 後年度負担金
+    -- 見積・要件・根拠
+    estimate_text      TEXT,                   -- 見積（テキスト）
+    estimate_file      TEXT,                   -- 見積（ファイルパス）
+    requirements_text  TEXT,                   -- 要件（テキスト）
+    requirements_file  TEXT,                   -- 要件（ファイルパス）
+    basis_text         TEXT,                   -- 根拠（テキスト）
+    basis_file         TEXT,                   -- 根拠（ファイルパス）
+    evaluator_name     TEXT,                   -- 評価者名（自由入力・自動保存）
+    created_at         TIMESTAMP DEFAULT now()
+);
+#+end_src
+
+*** 経費区分（別紙２準拠）
+
+| 値                         | 別紙２区分                                           |
+|----------------------------+------------------------------------------------------|
+| 整備費（投資的整備）       | 整備経費 > 投資的整備（積極的に効果を得ることを目的とするもの） |
+| 整備費（維持的整備）       | 整備経費 > 維持的整備（外部環境変更等による義務的整備）|
+| 整備費（サービス利用料）   | 整備経費 > サービス利用料（クラウドサービス等）       |
+| 運用費                     | 運用等経費 > 運用費                                  |
+| 保守費                     | 運用等経費 > 保守費                                  |
+
+** 2.5 review_threads（指摘スレッド）
+
+#+begin_src sql
+CREATE TABLE IF NOT EXISTS review_threads (
+    id          SERIAL PRIMARY KEY,
+    project_id  INT REFERENCES projects(id) NOT NULL,
+                -- 0: システム全体、1..N: 各事業
+    thread_no   INT NOT NULL,     -- 事業内連番（#1, #2...）
+    title       TEXT,             -- 指摘タイトル（任意）
+    status      TEXT NOT NULL DEFAULT 'open'
+                CHECK (status IN ('open', 'replied', 'reviewing', 'closed')),
+    due_date    DATE,             -- 期限日（スレッド単位）
+    created_at  TIMESTAMP DEFAULT now(),
+    UNIQUE (project_id, thread_no)
+);
+#+end_src
+
+** 2.6 review_entries（スレッド内投稿）
+
+#+begin_src sql
+CREATE TABLE IF NOT EXISTS review_entries (
+    id          SERIAL PRIMARY KEY,
+    thread_id   INT REFERENCES review_threads(id) NOT NULL,
+    seq         INT NOT NULL,     -- スレッド内連番（1, 2, 3...）
+    entry_type  TEXT NOT NULL
+                CHECK (entry_type IN ('issue', 'reply', 'review', 'close')),
+    role        TEXT NOT NULL
+                CHECK (role IN ('evaluator', 'pjmo', 'ai')),
+                -- 評価者・PJMOの個人名は保持しない
+    comment     TEXT NOT NULL,
+    entry_date  DATE,             -- 記録日付
+    created_at  TIMESTAMP DEFAULT now(),
+    UNIQUE (thread_id, seq)
+);
+#+end_src
+
+#+begin_quote
+設計上の注意：評価者・PJMOの個人名は =review_entries= に保持しない。
+評価者名は =projects.evaluator_name= のみで管理する。
+#+end_quote
+
+** 2.7 ステータス遷移
+
+*** スレッドステータス（review_threads.status）
+
+#+begin_example
+┌─────────────────────────────────────────────────────────────┐
+│                                                             │
+│  open ──[PJMO reply]──▶ replied ──[evaluator review]──▶ reviewing
+│                                            │                │
+│           ◀──[PJMO reply]──────────────────┘                │
+│                                      （複数サイクル繰り返し可）│
+│                                                             │
+│  replied / reviewing ──[evaluator close]──▶ closed          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+#+end_example
+
+*** entry_type と role の対応
+
+| entry_type | role      | thread.status 変化         | 説明              |
+|------------+-----------+----------------------------+-------------------|
+| issue      | evaluator | → open                    | 指摘投稿          |
+| issue      | ai        | → open                    | AI自動指摘        |
+| reply      | pjmo      | open/reviewing → replied  | PJMO回答          |
+| review     | evaluator | replied → reviewing       | 評価者再評価      |
+| close      | evaluator | any → closed              | 確定（サイクル終了） |
+
+*** ステータス説明
+
+| status    | 説明                                        |
+|-----------+---------------------------------------------|
+| open      | 指摘が入った状態（PJMO未回答）              |
+| replied   | PJMOが回答済み（評価者の再評価待ち）        |
+| reviewing | 評価者が再評価中（PJMOの再回答待ち）        |
+| closed    | 確定（評価サイクル完了）                    |
+
+** 2.8 project_files（添付ファイル管理）
+
+#+begin_src sql
+CREATE TABLE IF NOT EXISTS project_files (
+    id          SERIAL PRIMARY KEY,
+    project_id  INT REFERENCES projects(id) NOT NULL,
+    file_type   TEXT NOT NULL
+                CHECK (file_type IN ('estimate', 'requirements', 'basis')),
+    filename    TEXT NOT NULL,    -- 元ファイル名
+    filepath    TEXT NOT NULL,    -- サーバー保存パス
+    filesize    INT,              -- ファイルサイズ（bytes）
+    created_at  TIMESTAMP DEFAULT now()
+);
+-- ファイルは backend/uploads/{project_id}/ に保存
+-- DBにはパスのみ格納
+#+end_src
+
+** 2.9 既存テーブル（継続）
+
+#+begin_src sql
+-- 監査ログ（変更なし）
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id           SERIAL PRIMARY KEY,
+    project_id   INT,
+    user_name    TEXT,
+    action       TEXT NOT NULL,
+    target_table TEXT,
+    target_id    INT,
+    detail       JSONB,
+    created_at   TIMESTAMP DEFAULT now()
+);
+
+-- Webhook送信ログ（変更なし）
+CREATE TABLE IF NOT EXISTS webhook_logs (
+    id          SERIAL PRIMARY KEY,
+    project_id  INT REFERENCES projects(id),
+    event_type  TEXT NOT NULL,
+    payload     JSONB,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    sent_at     TIMESTAMP,
+    created_at  TIMESTAMP DEFAULT now()
+);
+#+end_src
+
+* 3. APIエンドポイント設計
+
+** 3.1 システム管理（新規）
+
+| Method | Path                         | 権限   | 説明                           |
+|--------+------------------------------+--------+--------------------------------|
+| GET    | =/systems/=                  | read   | システム一覧（事業数含む）     |
+| POST   | =/systems/=                  | write  | システム新規作成               |
+| PUT    | =/systems/{id}=              | write  | システム更新                   |
+| DELETE | =/systems/{id}=              | manage | システム削除（事業なし時のみ） |
+| GET    | =/systems/{id}/projects=     | read   | 事業一覧（project_id=0含む）   |
+
+** 3.2 事業管理（改訂）
+
+| Method | Path                         | 権限   | 説明                             |
+|--------+------------------------------+--------+----------------------------------|
+| POST   | =/projects/=                 | write  | 事業新規作成                     |
+| PUT    | =/projects/{id}=             | write  | 事業更新（経費区分・要求額等）   |
+| DELETE | =/projects/{id}=             | manage | 事業削除（スレッドなし時のみ）   |
+| POST   | =/projects/{id}/files=       | write  | ファイルアップロード             |
+| GET    | =/projects/{id}/files=       | read   | ファイル一覧                     |
+| DELETE | =/projects/{id}/files/{fid}= | write  | ファイル削除                     |
+
+** 3.3 評価ラリー（新規）
+
+| Method | Path                          | 権限  | 説明                            |
+|--------+-------------------------------+-------+---------------------------------|
+| GET    | =/threads/{project_id}=       | read  | スレッド一覧                    |
+| POST   | =/threads/=                   | write | 新規スレッド（issue 作成）      |
+| PUT    | =/threads/{id}/due=           | write | 期限日変更                      |
+| GET    | =/threads/{id}/entries=       | read  | 投稿一覧                        |
+| POST   | =/threads/{id}/entries=       | write | 投稿追加（reply/review/close）  |
+| POST   | =/threads/auto=               | write | AI自動指摘スレッド生成          |
+
+** 3.4 JSONエクスポート/インポート（新規）
+
+| Method | Path                               | 権限   | 説明                       |
+|--------+------------------------------------+--------+----------------------------|
+| GET    | =/export/system/{system_id}/json=  | export | システム単位JSONエクスポート |
+| POST   | =/import/system=                   | manage | JSONインポート              |
+| GET    | =/export/project/{project_id}/json=| export | 事業単位JSONエクスポート    |
+
+** 3.5 既存エンドポイント（継続）
+
+| Prefix     | 本数 | 主な操作                              |
+|------------+------+---------------------------------------|
+| =/advisor= | 1    | Ollama対話中継（予算評価AIアドバイザー）|
+| =/export=  | 2    | Excel/PDF出力（事業単位）             |
+| =/notify=  | 2    | Webhook送信・履歴                     |
+| =/users=   | 2    | ユーザー一覧・me                      |
+
+* 4. 画面構成
+
+** 4.1 ビュー一覧
+
+| キー         | ラベル             | 内容                                     | 状態     |
+|--------------+--------------------+------------------------------------------+----------|
+| =dashboard=  | ダッシュボード     | システム一覧・評価進捗サマリー           | 改訂     |
+| =systems=    | システム管理       | 評価対象システム・事業の登録/編集/一覧   | 新規     |
+| =rally=      | 評価ラリー         | 事業単位のスレッド一覧・投稿UI           | 改訂     |
+| =advisor=    | 予算評価AI         | DS-110/DS-910対話型評価チャット          | 継続     |
+| =audit=      | 監査ログ           | 全操作記録（evaluator以上）              | 継続     |
+| =webhook=    | 通知履歴           | MCP/Webhook送信履歴                      | 継続     |
+
+#+begin_quote
+「AI自動レビュー（ai）」ビューは「評価ラリー（rally）」に統合する。
+テキスト貼付でAI自動指摘スレッドを生成する機能として再実装する。
+#+end_quote
+
+** 4.2 ダッシュボード
+
+- システム一覧をカード形式で表示
+- 各カードに事業数・スレッド総数・open件数・closed率を表示
+- クリックでシステム詳細（事業一覧）へ遷移
+
+** 4.3 システム管理画面
+
+- システム新規作成フォーム（システム名・担当部署）
+- 事業一覧テーブル（事業名・経費区分・要求額合計・評価者名・スレッド数）
+- 事業追加フォーム（経費区分・要求額3種・評価者名・見積/要件/根拠テキスト+ファイル）
+
+** 4.4 評価ラリー画面
+
+#+begin_example
+┌──────────────┬────────────────────┬───────────────────────────┐
+│              │                    │                           │
+│  システム    │  スレッド一覧      │  スレッド詳細             │
+│  ・事業      │                    │                           │
+│  選択ペイン  │  [#1] 積算根拠確認 │  2025-01-10 evaluator     │
+│              │  期限: 03-31  open │  「積算根拠の内訳が...」  │
+│  [システム全体] │               │                           │
+│  [事業#1]    │  [#2] Cloud確認   │  2025-01-20 pjmo          │
+│  [事業#2]    │  期限: 03-15 closed│  「FP計算書を追加...」    │
+│  [＋ 事業追加] │              │                           │
+│              │  [＋ 指摘追加]    │  [再評価] [確定]          │
+│              │  [🤖 AI指摘]      │  ─────────────────────── │
+│              │                    │  [新規投稿フォーム]       │
+└──────────────┴────────────────────┴───────────────────────────┘
+#+end_example
+
+* 5. RBAC権限設計
+
+** 5.1 ロール定義
+
+| ロール      | read | write | confirm | export | manage | 説明                         |
+|-------------+------+-------+---------+--------+--------+------------------------------|
+| admin       | ✓    | ✓     | ✓       | ✓      | ✓      | 管理者（全操作可）           |
+| evaluator   | ✓    | ✓     | ✓       | ✓      |        | 評価者（指摘・確定・エクスポート） |
+| pjmo        | ✓    | ✓     |         |        |        | PJMO（回答）                 |
+| viewer      | ✓    |       |         |        |        | 閲覧者                       |
+
+** 5.2 操作別権限
+
+| 操作                            | 必要権限               |
+|---------------------------------+------------------------|
+| システム・事業・スレッドの参照  | read                   |
+| システム・事業の登録/更新       | write                  |
+| 新規スレッド（issue）作成       | write（evaluator/admin）|
+| PJMO回答（reply）投稿           | write（pjmo/admin）    |
+| 評価者再評価（review）投稿      | write（evaluator/admin）|
+| 確定（close）投稿               | write（evaluator/admin）|
+| AI自動指摘スレッド生成          | write                  |
+| ファイルアップロード             | write                  |
+| Excel/PDF/JSONエクスポート      | export                 |
+| JSONインポート                  | manage（admin）        |
+| システム・事業の削除            | manage（admin）        |
+
+** 5.3 認証方式
+
+現在はリクエストヘッダー =X-User-Role= によるシンプル認証。
+本番環境では Keycloak JWT 検証に差し替え可能な設計とする。
+
+#+begin_src python
+# auth.py
+ROLE_PERMISSIONS = {
+    "admin":     {"read", "write", "confirm", "export", "manage"},
+    "evaluator": {"read", "write", "confirm", "export"},
+    "pjmo":      {"read", "write"},
+    "viewer":    {"read"},
+}
+#+end_src
+
+* 6. JSONエクスポート/インポート仕様
+
+** 6.1 スキーマ
+
+#+begin_src json
+{
+  "export_version": "1.0",
+  "exported_at": "2025-04-19T12:00:00+09:00",
+  "system": {
+    "id": 1,
+    "name": "人事給与システム（次期）",
+    "department": "人事院"
+  },
+  "projects": [
+    {
+      "id": 0,
+      "name": "システム全体",
+      "cost_category": null,
+      "amount_single": 0,
+      "amount_advance": 0,
+      "amount_deferred": 0,
+      "evaluator_name": null,
+      "threads": [
+        {
+          "thread_no": 1,
+          "title": "アーキテクチャ全体確認",
+          "status": "open",
+          "due_date": "2025-05-31",
+          "entries": [
+            {
+              "seq": 1,
+              "entry_type": "issue",
+              "role": "evaluator",
+              "comment": "Cloud by Default原則との整合性を説明してください。",
+              "entry_date": "2025-04-10"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "name": "令和8年度 整備事業",
+      "cost_category": "整備費（投資的整備）",
+      "amount_single": 150000,
+      "amount_advance": 0,
+      "amount_deferred": 80000,
+      "evaluator_name": "田中係長",
+      "threads": [
+        {
+          "thread_no": 1,
+          "title": "積算根拠の確認",
+          "status": "closed",
+          "due_date": "2025-03-31",
+          "entries": [
+            {
+              "seq": 1,
+              "entry_type": "issue",
+              "role": "evaluator",
+              "comment": "積算根拠の内訳が不明確です。FP法による規模見積の詳細を提示してください。",
+              "entry_date": "2025-01-10"
+            },
+            {
+              "seq": 2,
+              "entry_type": "reply",
+              "role": "pjmo",
+              "comment": "FP計算書（別紙3）を追加しました。142FP、開発工数2.8PY相当です。",
+              "entry_date": "2025-01-20"
+            },
+            {
+              "seq": 3,
+              "entry_type": "review",
+              "role": "evaluator",
+              "comment": "FP計算書を確認しました。クラウド移行コストの根拠が不足しています。",
+              "entry_date": "2025-01-25"
+            },
+            {
+              "seq": 4,
+              "entry_type": "reply",
+              "role": "pjmo",
+              "comment": "移行コスト試算書（別紙4）を追加しました。",
+              "entry_date": "2025-02-01"
+            },
+            {
+              "seq": 5,
+              "entry_type": "close",
+              "role": "evaluator",
+              "comment": "根拠を確認しました。問題なし。確定します。",
+              "entry_date": "2025-02-05"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+#+end_src
+
+** 6.2 インポート時の動作
+
+- =system.id= は無視し、新規採番する
+- =project.id= は無視し、新規採番する（id=0 のシステム全体は自動作成）
+- スレッドと投稿は =thread_no= および =seq= の順序で復元する
+- 既存データとの重複チェック: システム名が一致する場合は確認プロンプトを表示
+
+* 7. 移行計画
+
+** 7.1 現行→新スキーマ変換方針
+
+| 現行テーブル/カラム             | 新テーブル/カラム                           | 変換方法                         |
+|---------------------------------+---------------------------------------------+----------------------------------|
+| projects（category=system）     | systems                                     | systemsテーブルに移行            |
+| projects（category=project）    | projects（新）                              | system_id を付与して移行         |
+| projects.description            | systems.department                          | 担当部署として再利用             |
+| review_logs（全体）             | review_threads + review_entries             | 1レコード → スレッド1件+エントリ1件 |
+| review_logs.author              | （削除）                                    | 個人名は保持しない               |
+| review_logs.version             | review_entries.seq                          | 連番として移行                   |
+| review_logs.status              | entry_type + review_threads.status          | 分離して移行                     |
+| review_logs.confirmed_by        | review_entries（entry_type='close'）        | closeエントリとして移行          |
+| review_logs.confirmed_at        | review_entries.entry_date                   | 記録日付として移行               |
+
+** 7.2 移行手順
+
+1. =systems= テーブル作成・既存 =projects（category=system）= から移行
+2. =projects= テーブルに =system_id=, =cost_category=, =amount_*=, =evaluator_name= カラム追加
+3. =review_threads=, =review_entries= テーブル新規作成
+4. =project_files= テーブル新規作成
+5. =review_logs= を =review_threads= + =review_entries= へ変換移行
+6. 旧テーブル =review_logs= は =backup_review_logs= にリネームして保持
+
+** 7.3 移行スクリプト（概要）
+
+#+begin_src sql
+-- Step 1: systems テーブル作成
+CREATE TABLE systems AS
+  SELECT id, name, description AS department, created_at
+  FROM projects
+  WHERE category = 'system';
+
+-- Step 2: projects に system_id を追加
+ALTER TABLE projects ADD COLUMN system_id INT REFERENCES systems(id);
+-- ※ 既存の category='project' レコードへの system_id 割り当ては手動確認が必要
+
+-- Step 3: review_threads 作成（既存 review_logs から1スレッド1投稿として移行）
+INSERT INTO review_threads (project_id, thread_no, status, created_at)
+SELECT project_id,
+       ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY created_at),
+       CASE status WHEN 'close' THEN 'closed' ELSE 'open' END,
+       created_at
+FROM review_logs;
+
+-- Step 4: review_entries 作成
+INSERT INTO review_entries (thread_id, seq, entry_type, role, comment, entry_date)
+SELECT rt.id, 1,
+       rl.status,
+       CASE rl.role WHEN '評価者' THEN 'evaluator' WHEN 'PJMO' THEN 'pjmo' ELSE 'ai' END,
+       rl.comment,
+       rl.created_at::date
+FROM review_logs rl
+JOIN review_threads rt ON rt.project_id = rl.project_id;
+
+-- Step 5: 旧テーブルをバックアップ
+ALTER TABLE review_logs RENAME TO backup_review_logs;
+#+end_src
+
+* 8. 技術的補足
+
+** 8.1 ファイルアップロード
+
+- アップロード先: =backend/uploads/{project_id}/{file_type}/{filename}=
+- 許可拡張子: =.pdf=, =.docx=, =.xlsx=, =.pptx=, =.txt=
+- 最大ファイルサイズ: 10MB
+- DBには =filepath= のみ格納。ファイル本体はサーバーローカルに保持
+
+** 8.2 Ollama設定
+
+| 設定              | 値                        | 変更方法                    |
+|-------------------+---------------------------+-----------------------------|
+| デフォルトモデル  | qwen2.5                   | =OLLAMA_MODEL= 環境変数     |
+| Ollama URL        | http://ollama:11434       | =OLLAMA_URL= 環境変数       |
+| タイムアウト      | 180秒（advisor: 180秒）   | advisor_router.py           |
+
+#+begin_src shell :eval no
+# モデル変更手順
+docker compose exec ollama ollama pull qwen2.5:14b
+# docker-compose.yml の OLLAMA_MODEL を変更
+docker compose restart backend
+#+end_src
+
+** 8.3 推奨モデル一覧
+
+| モデル         | サイズ  | 特徴                             |
+|----------------+---------+----------------------------------|
+| =qwen2.5=      | ~4.7GB  | デフォルト。日本語対応が強い     |
+| =qwen2.5:14b=  | ~9GB    | 高精度・日本語特化               |
+| =qwen2.5:7b=   | ~4.7GB  | 7Bパラメータ・バランス型         |
+| =llama3.2=     | ~2GB    | 軽量・高速（英語中心）           |
+| =mistral=      | ~4.1GB  | 汎用高性能                       |
+
+** 8.4 Docker Compose サービス構成
+
+#+begin_src yaml :eval no
+services:
+  db:       # PostgreSQL 16（ポート5432）
+  backend:  # FastAPI（ポート8000、volumes: なし）
+  frontend: # Vite dev（ポート3005、volumes: ./frontend/src:/app/src）
+  ollama:   # Ollama（ポート11434、volumes: ollama_data:/root/.ollama）
+#+end_src
+
